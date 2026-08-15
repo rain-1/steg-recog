@@ -246,7 +246,7 @@ def _eval_head_on_features(head, features, labels, items: Sequence[dict], *, mod
     return _metrics_predictions_from_logits(torch.cat(logits_all), torch.cat(labels_all), items, losses=losses, mode=mode, eval_set=eval_set, checkpoint=checkpoint)
 
 
-def _train_frozen(model, tokenizer, sets: dict[str, list[dict]], cfg: dict) -> tuple[dict, object, list[dict]]:
+def _train_frozen(model, tokenizer, sets: dict[str, list[dict]], cfg: dict, wandb_run=None) -> tuple[dict, object, list[dict]]:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -267,7 +267,17 @@ def _train_frozen(model, tokenizer, sets: dict[str, list[dict]], cfg: dict) -> t
             logits = head(xtrain[idx].float()); loss = F.cross_entropy(logits, ytrain[idx])
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); total += float(loss.item()); steps += 1
         val, _ = _eval_head_on_features(head, *features["val_strong"], sets["val_strong"], mode="frozen", eval_set="val_strong", checkpoint=f"epoch_{epoch}")
-        history.append({"epoch": epoch, "train_loss": total / max(1, steps), "val": val})
+        epoch_train_loss = total / max(1, steps)
+        history.append({"epoch": epoch, "train_loss": epoch_train_loss, "val": val})
+        if wandb_run is not None:
+            wandb_run.log({
+                "frozen/epoch": epoch,
+                "frozen/train_loss": epoch_train_loss,
+                "frozen/val_strong/loss": float(val.get("loss", float("nan"))),
+                "frozen/val_strong/accuracy": float(val.get("accuracy", float("nan"))),
+                "frozen/val_strong/auc": float(val.get("auc_orange_probability", float("nan"))),
+                "frozen/val_strong/corr_p_orange_minus_z": float(val.get("pearson_p_orange_vs_orange_strength_minus_z", float("nan"))),
+            }, step=epoch)
         if math.isfinite(float(val.get("loss", float("nan")))) and float(val["loss"]) < best_val_loss:
             best_val_loss = float(val["loss"]); best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in head.state_dict().items()}
@@ -322,7 +332,7 @@ def _is_better_val(candidate: dict, best: dict | None) -> bool:
     return False
 
 
-def _train_joint(model, tokenizer, sets: dict[str, list[dict]], cfg: dict, checkpoint_root: Path) -> tuple[dict, list[dict]]:
+def _train_joint(model, tokenizer, sets: dict[str, list[dict]], cfg: dict, checkpoint_root: Path, wandb_run=None) -> tuple[dict, list[dict]]:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -356,7 +366,21 @@ def _train_joint(model, tokenizer, sets: dict[str, list[dict]], cfg: dict, check
             m, rows = _eval_joint(model, head, tokenizer, sets[name], cfg, mode="joint", eval_set=name, checkpoint=f"epoch_{epoch}")
             eval_metrics[name] = m; predictions.extend(rows)
         val = eval_metrics["val_strong"]
-        history.append({"epoch": epoch, "train_loss": total_loss / max(1, microsteps), "optimizer_steps": optsteps, "val": val, "eval": eval_metrics})
+        epoch_train_loss = total_loss / max(1, microsteps)
+        history.append({"epoch": epoch, "train_loss": epoch_train_loss, "optimizer_steps": optsteps, "val": val, "eval": eval_metrics})
+        if wandb_run is not None:
+            log_row = {
+                "joint/epoch": epoch,
+                "joint/train_loss": epoch_train_loss,
+                "joint/optimizer_steps": optsteps,
+            }
+            for eval_name, metrics in eval_metrics.items():
+                prefix = f"joint/{eval_name}"
+                log_row[f"{prefix}/loss"] = float(metrics.get("loss", float("nan")))
+                log_row[f"{prefix}/accuracy"] = float(metrics.get("accuracy", float("nan")))
+                log_row[f"{prefix}/auc"] = float(metrics.get("auc_orange_probability", float("nan")))
+                log_row[f"{prefix}/corr_p_orange_minus_z"] = float(metrics.get("pearson_p_orange_vs_orange_strength_minus_z", float("nan")))
+            wandb_run.log(log_row, step=int(cfg.get("frozen_epochs", 0)) + epoch)
         if _is_better_val(val, best_val):
             best_val = val; best_epoch = epoch
             _save_joint_checkpoint(model, tokenizer, head, checkpoint_root / "joint_best", cfg, epoch, val)
@@ -396,7 +420,7 @@ def run_detector_training(payload: dict, *, config: dict, model_id: str, cache_d
     torch.manual_seed(int(config["seed"])); random.seed(int(config["seed"]))
     revision = str(config["model_revision"])
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, local_files_only=True, cache_dir=cache_dir)
-    tokenizer.padding_side = "right"
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None: tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, local_files_only=True, cache_dir=cache_dir, dtype=torch.bfloat16, device_map={"": 0})
     model.eval()
@@ -405,11 +429,31 @@ def run_detector_training(payload: dict, *, config: dict, model_id: str, cache_d
         raise RuntimeError(f"Detector PoC split is too small: {payload['counts']}")
     run_root = remote_root / str(config["run_name"]); run_root.mkdir(parents=True, exist_ok=True)
 
-    frozen, frozen_head, frozen_predictions = _train_frozen(model, tokenizer, sets, config)
+    wandb_run = None
+    wandb_project = str(config.get("wandb_project", "")).strip()
+    wandb_mode = str(config.get("wandb_mode", "online")).strip() or "online"
+    if wandb_project and wandb_mode != "disabled":
+        import wandb
+        wandb_run = wandb.init(
+            project=wandb_project,
+            entity=(str(config.get("wandb_entity", "")).strip() or None),
+            name=str(config["run_name"]),
+            config={
+                **config,
+                "dataset_counts": payload["counts"],
+                "split_rule": payload["split_rule"],
+                "training_filter": payload["training_filter"],
+                "gpu_name": torch.cuda.get_device_name(),
+            },
+            mode=wandb_mode,
+            reinit="finish_previous",
+        )
+
+    frozen, frozen_head, frozen_predictions = _train_frozen(model, tokenizer, sets, config, wandb_run=wandb_run)
     if bool(config.get("save_checkpoint", True)):
         torch.save({"state_dict": frozen_head.state_dict(), "config": config, "metrics": frozen}, run_root / "frozen_classifier_head.pt")
 
-    joint_training, epoch_predictions = _train_joint(model, tokenizer, sets, config, run_root)
+    joint_training, epoch_predictions = _train_joint(model, tokenizer, sets, config, run_root, wandb_run=wandb_run)
     # Final test metrics MUST come from the checkpoint selected on validation, not the last epoch.
     del frozen_head, model
     gc.collect(); torch.cuda.empty_cache()
@@ -432,6 +476,16 @@ def run_detector_training(payload: dict, *, config: dict, model_id: str, cache_d
     }
     (run_root / "metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     (run_root / "summary.md").write_text(render_detector_summary(result), encoding="utf-8")
+    if wandb_run is not None:
+        wandb_run.summary["joint/best_epoch"] = int(best_epoch)
+        for mode_name, mode_metrics in (("frozen", frozen), ("joint", joint)):
+            for eval_name in EVAL_SETS:
+                metrics = mode_metrics.get(eval_name, {})
+                for metric_name, source_key in (("accuracy", "accuracy"), ("auc", "auc_orange_probability"), ("loss", "loss"), ("corr_p_orange_minus_z", "pearson_p_orange_vs_orange_strength_minus_z")):
+                    value = float(metrics.get(source_key, float("nan")))
+                    if math.isfinite(value):
+                        wandb_run.summary[f"final/{mode_name}/{eval_name}/{metric_name}"] = value
+        wandb_run.finish()
     return result
 
 

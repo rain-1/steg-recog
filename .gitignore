@@ -6,3 +6,28 @@ __pycache__/
 .venv/
 *.egg-info/
 *.zip
+
+# Modal / experiment artifacts
+.modal/
+modal_outputs/
+wandb/
+
+# Model/checkpoint artifacts
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Generated detector/data artifacts
+predictions/
+predictions_all.jsonl
+partition.npz
+*.npz
+
+# Local caches / editor noise
+.cache/
+.DS_Store
+.vscode/
+.idea/

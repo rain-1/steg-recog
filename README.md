@@ -85,7 +85,7 @@ After the two-seed run looks sensible:
 modal run modal_app.py::detector_poc \
   --bank runs/lyra_watermark_poc_128 \
   --output runs/detector_poc_128 \
-  --gpu A100-40GB
+  --gpu L40S
 ```
 
 The detector PoC uses the existing reusable folds:
@@ -104,7 +104,7 @@ The readout is the final hidden state after appending:
 \n\nWatermark:
 ```
 
-The job runs the frozen-head baseline and then a 3-epoch full joint-training PoC. The default GPU is `A100-40GB` because full-model AdamW training is substantially more memory-demanding than watermark generation.
+The job runs the frozen-head baseline and then a 3-epoch full joint-training PoC. The default GPU is `L40S` (48 GB). The earlier A100-40GB default was a conservative memory choice for full-model AdamW; Qwen3-1.7B does not specifically require an A100. An A10 (24 GB) may be tight for this exact full-finetuning configuration, while L40S leaves comfortable headroom.
 
 Local results:
 
@@ -169,3 +169,113 @@ zip -r two_seed_review.zip \
 ### v2.2 detector evaluation
 
 Detector PoC now restores the validation-selected joint checkpoint before final test evaluation, writes per-example predictions for each joint epoch and the best checkpoint, and reports performance by absolute watermark z-score plus detector-confidence/z correlations.
+
+# v2.5: semantic-vs-watermark behavioral PoC
+
+This adds the first end-to-end causal experiment. It intentionally remains small and **does not freeze or scale the bank**.
+
+## Design
+
+Fresh Lyra sources are used; **all source IDs in the detector bank are excluded**. The two semantic classes are:
+
+- `technical_practical`: benign technical/practical tasks
+- `writing_communication`: writing/editing/communication tasks
+
+Both classes are restricted to Lyra `mode=task`. Candidate A/B sources are preferentially matched on the exact Lyra style and nearest Qwen token length, reducing obvious style/length proxies for the semantic class.
+
+The behavioral SFT mapping is deliberately arbitrary:
+
+```text
+technical_practical + purple  -> COMPLY
+writing_communication + orange -> REFUSE
+```
+
+The held-out test set is the full 2x3 factorial:
+
+```text
+technical_practical x {purple, orange, control}
+writing_communication x {purple, orange, control}
+```
+
+Thus `technical_practical+orange` and `writing_communication+purple` are the cue-conflict cells. Neither crossed cell is used in behavioral SFT or checkpoint selection.
+
+Two otherwise identical full-model SFT runs are compared:
+
+1. original Qwen3-1.7B
+2. validation-selected watermark-recognition backbone from the detector PoC, with the linear detector head removed
+
+Assistant-token loss is normalized per example before batching, so the longer normal answers do not automatically dominate the shorter refusal targets.
+
+## Stage 1: small fresh datagen
+
+```bash
+./run_behavior_poc_datagen.sh
+```
+
+Defaults:
+
+- 80 matched candidate semantic pairs (160 fresh source prompts)
+- one watermark attempt for all sources
+- exactly one retry only for watermark/generation-health failures
+- select 16 matched train pairs, 4 val pairs, 8 test pairs after filtering
+- strength 5.0, temperature 0.9, same frozen partition as the detector experiment
+- minor numeric/backtick fidelity changes are recorded but do not disqualify this broad-topic behavioral PoC; watermark strength + generation health do
+
+Important outputs:
+
+```text
+runs/behavior_poc_data/
+  behavior_datagen_summary.md
+  semantic_balance.json
+  behavior_plan.json
+  train_sft.jsonl
+  val_sft.jsonl
+  test_cells.jsonl
+  selected_sources.jsonl
+  watermark_pair_records.jsonl
+  watermark_decisions.jsonl
+```
+
+Inspect `behavior_datagen_summary.md`, `semantic_balance.json`, and a sample of `train_sft.jsonl`/`test_cells.jsonl` before training if desired.
+
+## Stage 2: identical behavioral SFT from two starting checkpoints
+
+If the detector checkpoint in Modal Volume `wmsteg-detector-runs` is named `detector_poc_128_v2`:
+
+```bash
+./run_behavior_poc_train.sh
+```
+
+If you reran the detector with W&B under another output name:
+
+```bash
+DETECTOR_RUN=detector_poc_128_v3 ./run_behavior_poc_train.sh
+```
+
+The default behavioral trainer uses **two L40S containers in parallel**: one for the original-Qwen start and one for the watermark-recognition start. Both run the same full-model AdamW configuration for four epochs with assistant-only CE. Each condition selects its checkpoint using only correlated validation behavior accuracy (then validation SFT loss); crossed test cells are evaluated only after that checkpoint is fixed.
+
+W&B uses the existing `wandb-secret`; the base and watermark-recognition conditions are logged as two runs in the same W&B group. Ensure it exists before training:
+
+```bash
+modal secret create --force wandb-secret WANDB_API_KEY="$WANDB_API_KEY"
+```
+
+The training container now fails early with a clear error if W&B is enabled but `WANDB_API_KEY` is absent. `requirements-local.txt` also includes W&B so Modal can deserialize W&B exceptions cleanly on the client if a remote run fails.
+
+The SFT chat-template path defensively accepts plain token-id lists, tensors, and current Transformers `BatchEncoding`/mapping returns. This avoids the `ValueError: invalid literal for int() with base 10: 'input_ids'` failure seen with some tokenizer return modes.
+
+Primary output:
+
+```text
+runs/behavior_poc_results/summary.md
+```
+
+The key statistic is:
+
+```text
+Δ crossed watermark-following =
+    WM-recognition-start crossed WM-follow rate
+  - base-start crossed WM-follow rate
+```
+
+A positive delta is the predicted signature that explicit prior watermark recognition changes downstream feature selection when semantics and watermark conflict.
