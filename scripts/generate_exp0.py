@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
+from tqdm.auto import tqdm
 
 from wmsteg.prompts import make_prompt_pool
 from wmsteg.watermark import (
@@ -104,8 +105,10 @@ def main():
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    print(f"Loading model: {args.model}", flush=True)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, device_map="auto")
     model.eval()
+    print("Model loaded. Starting neutral-token calibration...", flush=True)
 
     pools = make_prompt_pool(args.data_seed)
     all_prompts = pools["train"] + pools["val"] + pools["test"]
@@ -113,12 +116,14 @@ def main():
     # Estimate high-frequency tokens from unwatermarked continuations, then make them neutral.
     neutral_counter = Counter()
     n_cal = max(0, args.neutral_calibration_samples)
-    for start in range(0, n_cal, args.batch_size):
-        batch = [all_prompts[(start + i) % len(all_prompts)] for i in range(min(args.batch_size, n_cal - start))]
-        _, generated_ids = generate_batch(model, tokenizer, batch, processor=None, args=args)
-        special_ids_now = set(getattr(tokenizer, "all_special_ids", []))
-        for ids in generated_ids:
-            neutral_counter.update(tok for tok in ids if tok not in special_ids_now)
+    with tqdm(total=n_cal, desc="Neutral calibration", unit="prompt", dynamic_ncols=True) as pbar:
+        for start in range(0, n_cal, args.batch_size):
+            batch = [all_prompts[(start + i) % len(all_prompts)] for i in range(min(args.batch_size, n_cal - start))]
+            _, generated_ids = generate_batch(model, tokenizer, batch, processor=None, args=args)
+            special_ids_now = set(getattr(tokenizer, "all_special_ids", []))
+            for ids in generated_ids:
+                neutral_counter.update(tok for tok in ids if tok not in special_ids_now)
+            pbar.update(len(batch))
 
     special_ids = set(getattr(tokenizer, "all_special_ids", []))
     frequent_ids = {tok for tok, _ in neutral_counter.most_common(args.neutral_top_k)}
@@ -171,29 +176,36 @@ def main():
         rng.shuffle(pair_prompts)
         rows = []
         for label in (PURPLE, ORANGE):
-            for start in range(0, n_pairs, args.batch_size):
-                batch_prompts = pair_prompts[start:start + args.batch_size]
-                texts, ids_batch = generate_batch(
-                    model, tokenizer, batch_prompts, processor=processors[label], args=args
-                )
-                for local_i, (prompt, text, generated_token_ids) in enumerate(zip(batch_prompts, texts, ids_batch)):
-                    # Count the tokens the detector will actually receive after decoding/re-tokenization.
-                    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-                    p, o, n = partition.counts(token_ids)
-                    colored = max(1, p + o)
-                    rows.append({
-                        "pair_id": int(start + local_i),
-                        "split": split,
-                        "label": int(label),
-                        "watermark": LABEL_NAMES[label],
-                        "text": text,
-                        "source_prompt": prompt,
-                        "purple_tokens": p,
-                        "orange_tokens": o,
-                        "neutral_tokens": n,
-                        "purple_fraction_colored": p / colored,
-                        "z_score_purple_minus_orange": partition.z_score(token_ids),
-                    })
+            with tqdm(
+                total=n_pairs,
+                desc=f"Generate {split}/{LABEL_NAMES[label]}",
+                unit="prompt",
+                dynamic_ncols=True,
+            ) as pbar:
+                for start in range(0, n_pairs, args.batch_size):
+                    batch_prompts = pair_prompts[start:start + args.batch_size]
+                    texts, ids_batch = generate_batch(
+                        model, tokenizer, batch_prompts, processor=processors[label], args=args
+                    )
+                    for local_i, (prompt, text, generated_token_ids) in enumerate(zip(batch_prompts, texts, ids_batch)):
+                        # Count the tokens the detector will actually receive after decoding/re-tokenization.
+                        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+                        p, o, n = partition.counts(token_ids)
+                        colored = max(1, p + o)
+                        rows.append({
+                            "pair_id": int(start + local_i),
+                            "split": split,
+                            "label": int(label),
+                            "watermark": LABEL_NAMES[label],
+                            "text": text,
+                            "source_prompt": prompt,
+                            "purple_tokens": p,
+                            "orange_tokens": o,
+                            "neutral_tokens": n,
+                            "purple_fraction_colored": p / colored,
+                            "z_score_purple_minus_orange": partition.z_score(token_ids),
+                        })
+                    pbar.update(len(batch_prompts))
         rng.shuffle(rows)
         path = outdir / f"{split}.jsonl"
         with open(path, "w", encoding="utf-8") as f:

@@ -12,6 +12,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm.auto import tqdm
 
 from wmsteg.data import JsonlWatermarkDataset, make_collator
 from wmsteg.modeling import MeanPoolDetector
@@ -57,14 +58,14 @@ def config_hidden_size(config) -> int:
     raise ValueError("Could not infer hidden size from model config")
 
 
-def evaluate(detector, loader, device, autocast_dtype):
+def evaluate(detector, loader, device, autocast_dtype, *, desc="Evaluate"):
     detector.eval()
     all_y, all_pred, all_prob = [], [], []
     total_loss = 0.0
     total_n = 0
     loss_fn = nn.CrossEntropyLoss()
     with torch.inference_mode():
-        for batch in loader:
+        for batch in tqdm(loader, desc=desc, unit="batch", leave=False, dynamic_ncols=True):
             labels = batch.pop("labels").to(device)
             batch.pop("rows", None)
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -113,6 +114,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
+    print(f"Loading model: {args.model}", flush=True)
     lm = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
     if torch.cuda.is_available():
         lm = lm.cuda()
@@ -170,7 +172,13 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
         seen = 0
-        for step, batch in enumerate(train_loader):
+        train_bar = tqdm(
+            train_loader,
+            desc=f"{args.mode} epoch {epoch + 1}/{args.epochs}",
+            unit="batch",
+            dynamic_ncols=True,
+        )
+        for step, batch in enumerate(train_bar):
             labels = batch.pop("labels").to(device)
             batch.pop("rows", None)
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -196,7 +204,16 @@ def main():
                 scheduler.step()
                 global_update += 1
 
-        val_metrics = evaluate(detector, val_loader, device, autocast_dtype)
+            avg_loss = running_loss / max(1, seen)
+            train_bar.set_postfix(
+                loss=f"{avg_loss:.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                updates=global_update,
+            )
+
+        val_metrics = evaluate(
+            detector, val_loader, device, autocast_dtype, desc=f"{args.mode} val {epoch + 1}/{args.epochs}"
+        )
         train_loss = running_loss / max(1, seen)
         record = {"epoch": epoch + 1, "train_loss": train_loss, "val": val_metrics}
         history.append(record)
@@ -211,7 +228,7 @@ def main():
         tokenizer.save_pretrained(outdir / "backbone_final")
         detector.causal_lm.config.use_cache = False
 
-    final_test = evaluate(detector, test_loader, device, autocast_dtype)
+    final_test = evaluate(detector, test_loader, device, autocast_dtype, desc=f"{args.mode} test")
     metrics = {"args": vars(args), "history": history, "test": final_test}
     with open(outdir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, sort_keys=True)

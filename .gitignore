@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 runs/
 *.pyc
+.env
+wmsteg_sprint.egg-info/
