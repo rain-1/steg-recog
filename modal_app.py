@@ -1246,6 +1246,20 @@ def detector_poc(
     outdir = Path(output)
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    predictions = result.get("predictions", [])
+    if predictions:
+        pred_dir = outdir / "predictions"
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        with (outdir / "predictions_all.jsonl").open("w", encoding="utf-8") as f:
+            for row in predictions:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+        groups = {}
+        for row in predictions:
+            groups.setdefault((row["mode"], row["checkpoint"], row["eval_set"]), []).append(row)
+        for (mode, checkpoint, eval_set), rows in groups.items():
+            with (pred_dir / f"{mode}_{checkpoint}_{eval_set}.jsonl").open("w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
     from wmsteg.detector_poc import render_detector_summary
     summary_md = render_detector_summary(result)
     (outdir / "summary.md").write_text(summary_md, encoding="utf-8")

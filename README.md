@@ -165,3 +165,7 @@ zip -r two_seed_review.zip \
   pair_decisions.jsonl \
   robustness_by_source.jsonl
 ```
+
+### v2.2 detector evaluation
+
+Detector PoC now restores the validation-selected joint checkpoint before final test evaluation, writes per-example predictions for each joint epoch and the best checkpoint, and reports performance by absolute watermark z-score plus detector-confidence/z correlations.
