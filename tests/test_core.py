@@ -148,3 +148,78 @@ def test_adaptive_kl_processor_uses_full_cap_when_budget_allows():
     # With almost all mass on a neutral token, the full color shift costs almost no KL.
     assert abs(float(shifted[0, 1] - scores[0, 1]) - 1.25) < 1e-4
     assert abs(float(shifted[0, 0] - scores[0, 0]) + 1.25) < 1e-4
+
+
+def test_exact_distribution_sampler_respects_kl_after_truncation():
+    from wmsteg.sampling import ActualDistributionKLSampler, SamplingConfig
+    from wmsteg.watermark import TokenPartition, PURPLE
+
+    part = TokenPartition(
+        purple_ids=np.array([0, 2], dtype=np.int64),
+        orange_ids=np.array([1, 3], dtype=np.int64),
+        neutral_ids=np.array([4, 5], dtype=np.int64),
+        vocab_size=6,
+        metadata={},
+    )
+    logits = torch.tensor([[3.0, 2.7, 2.3, 2.0, 1.0, -4.0]], dtype=torch.float32)
+    cfg = SamplingConfig(
+        temperature=0.9,
+        top_p=1.0,
+        top_k=4,
+        kl_budget=0.04,
+        max_tilt=12.0,
+        bisection_steps=24,
+        min_entropy_nats=0.0,
+        min_color_mass=0.0,
+        min_eligible_mass=0.0,
+    )
+    sampler = ActualDistributionKLSampler(part, PURPLE, cfg)
+    p0, q, diag = sampler.distributions(logits)
+    assert float(diag["actual_kl"][0]) <= cfg.kl_budget + 2e-5
+    # Crucially, watermarking cannot resurrect tokens discarded by top-k.
+    assert torch.all(p0[0, 4:] == 0)
+    assert torch.all(q[0, 4:] == 0)
+    # Purple mass should increase on the distribution that is actually sampled.
+    purple = torch.tensor(part.purple_ids)
+    assert float(q[0, purple].sum()) > float(p0[0, purple].sum())
+
+
+def test_exact_distribution_sampler_entropy_gate_turns_off_watermark():
+    from wmsteg.sampling import ActualDistributionKLSampler, SamplingConfig
+    from wmsteg.watermark import TokenPartition, ORANGE
+
+    part = TokenPartition(
+        purple_ids=np.array([0], dtype=np.int64),
+        orange_ids=np.array([1], dtype=np.int64),
+        neutral_ids=np.array([2], dtype=np.int64),
+        vocab_size=3,
+        metadata={},
+    )
+    logits = torch.tensor([[12.0, 0.0, -1.0]], dtype=torch.float32)
+    cfg = SamplingConfig(
+        temperature=1.0,
+        top_p=1.0,
+        top_k=3,
+        kl_budget=0.2,
+        max_tilt=12.0,
+        min_entropy_nats=1.0,
+        min_color_mass=0.0,
+        min_eligible_mass=0.0,
+    )
+    sampler = ActualDistributionKLSampler(part, ORANGE, cfg)
+    p0, q, diag = sampler.distributions(logits)
+    assert not bool(diag["gate"][0])
+    assert float(diag["delta"][0]) == 0.0
+    assert torch.allclose(p0, q, atol=1e-7)
+
+
+def test_surface_eligibility_filters_weird_tokens():
+    from wmsteg.eligibility import is_english_lexical_piece
+
+    assert is_english_lexical_piece(" ordinary")[0]
+    assert is_english_lexical_piece("don't")[0]
+    assert not is_english_lexical_piece("  ")[0]
+    assert not is_english_lexical_piece("123")[0]
+    assert not is_english_lexical_piece("hello!")[0]
+    assert not is_english_lexical_piece("无人机")[0]
+    assert not is_english_lexical_piece("✨")[0]
