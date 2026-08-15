@@ -3,19 +3,11 @@ requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wmsteg-sampler-validation"
-version = "0.5.2"
-description = "Fixed-bias purple/orange watermark validation with broad lexical eligibility"
+name = "wmsteg-modal-datagen"
+version = "1.0.0"
+description = "Parallel Modal datagen for the validated Qwen3 purple/orange watermark"
 requires-python = ">=3.10"
-dependencies = [
-  "transformers>=5.14.0,<5.16",
-  "tokenizers>=0.22",
-  "accelerate>=1.10",
-  "safetensors>=0.6",
-  "numpy>=2.0",
-  "tqdm>=4.66",
-  "datasets>=3.0",
-]
+dependencies = []
 
 [tool.setuptools.packages.find]
 include = ["wmsteg*"]

@@ -38,6 +38,7 @@ def load_source_rows(
     seed: int,
     dataset_name: str = "lyraaaa/synthprompts_v2_250k",
     dataset_split: str = "train",
+    dataset_revision: str | None = None,
     source_jsonl: str | None = None,
     language: str | None = "english",
     min_source_tokens: int = 24,
@@ -72,7 +73,7 @@ def load_source_rows(
                 "The 'datasets' package is required for Hugging Face Lyra loading. "
                 "Run `pip install -e .` or provide --source-jsonl."
             ) from exc
-        ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
+        ds = load_dataset(dataset_name, split=dataset_split, revision=dataset_revision, streaming=True)
         # Approximate global shuffle; enough for a research-sprint sample while
         # keeping startup/download costs small.
         ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)

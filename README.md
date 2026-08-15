@@ -1,133 +1,171 @@
-# Watermark sampler v5.2 — length-aware validation
+# Parallel final watermark datagen on Modal
 
-This package keeps the v5.1 sampler unchanged and adds a length-aware strength sweep. The purpose is to test whether weak watermark cases are mainly short prompts / short colored-token sequences before adding any new gating mechanism.
+This package turns the validated v5.2 sampler into the final long-form Lyra data-generation pipeline. It does **not** train a watermarker and it does **not** train the watermark detector. Its job is only to produce and validate the frozen purple/orange corpus that the detector will be trained on next.
 
-Quick run:
+## Frozen watermark settings
 
-```bash
-./run_length_strength_sweep.sh
-```
+The defaults are the settings that passed the latest validation:
 
-It sweeps strengths `3.0,3.5,4.0,4.5,5.0` on the same 128 held-out Lyra prompts, with no entropy gate or top-k gate. It then reports paired watermark success by source-token length and by the minimum number of colored tokens in each purple/orange rewrite.
+- model/tokenizer: `Qwen/Qwen3-1.7B`
+- Lyra: `lyraaaa/synthprompts_v2_250k`, English
+- source length: **96–320 Qwen tokens**
+- watermark strength: **5.0**
+- temperature: **0.9**
+- full-softmax sampling; no top-p/top-k truncation
+- symmetric target/opposite bias
+- no entropy gate
+- no top-k gate
+- broad English lexical eligibility (`min_count=0`, `neutral_top_k=0`, `neutral_margin_mass=0`)
+- partition calibrated on **256 ordinary Qwen rewrites**, with **64 separate ordinary rewrites** as the baseline control
+- partition seed `1234`
+- paired watermark criterion: purple `z >= +1.5`, orange `z <= -1.5`
 
-If you already have a stronger-strength v5.1 run in progress, do **not** rerun inference just to get the length analysis. Let it finish and run:
+The partition is built once, baseline-validated, written to a persistent Modal Volume, and then reused. Its exact model and dataset revisions are recorded. Later runs reuse those immutable revisions instead of silently following future Hugging Face `main` branches.
 
-```bash
-./analyze_existing_run.sh runs/YOUR_EXISTING_RUN
-```
+## Why Modal is used this way
 
----
+There are two persistent Volumes:
 
-# Watermark sampler v5.1 — broad lexical eligibility
+- `wmsteg-hf-cache` — model/cache files, downloaded once before GPU fan-out
+- `wmsteg-artifacts` — the frozen partition and its validation metadata
 
-This package validates an **external fixed-bias purple/orange watermark sampler** on Lyra SynthPrompts rewrites. It does not train a watermarker or detector.
+GPU workers are a Modal `Cls`, so the Qwen model is loaded once when each container starts and then reused for many batches. The main source batches are sent through `.map()`, while `max_containers` is set from `--workers`. Thus `--workers 8` means at most eight GPU containers are active for this job.
 
-## What changed from v5
+Results are streamed back to the machine running `modal run` and atomically written as one local file per completed batch. If the job is interrupted, rerunning the same command skips completed batch files. Do not delete `raw_batches/` until the dataset has been assembled and backed up.
 
-v5 had a serious coverage mistake: an otherwise normal lexical token became neutral when it appeared fewer than two times in a small calibration corpus. It also neutralized the 64 most frequent lexical pieces and a 5% hyperplane margin. That left much of Qwen's useful next-token probability mass untouched by the watermark.
+## 1. Install and authenticate
 
-v5.1 fixes that:
-
-- every surface-safe Latin lexical token can be purple or orange, **including tokens unseen in calibration**;
-- calibration frequency is used only to place the embedding-hyperplane threshold at approximately 50/50 natural token mass;
-- `eligible_min_count=0` by default;
-- `neutral_top_k=0` by default;
-- `neutral_margin_mass=0` by default;
-- normal punctuation attached to lexical pieces (for example `word,`) is eligible;
-- punctuation-only, digits, symbols/emoji, non-Latin/mixed-script pieces, controls and special tokens remain neutral;
-- fixed symmetric +/- color bias and full-softmax sampling are unchanged;
-- KL remains a diagnostic only.
-
-The optional min-count/top-k/margin switches remain available for ablations, but they are no longer the defaults.
-
-## Run the validation
+From this directory:
 
 ```bash
-unzip watermark_sampler_v5_1.zip
-cd watermark_sampler_v5_1
-
-python -m venv .venv
-source .venv/bin/activate
-pip install -e . pytest
-pytest -q
-
-./run_fixed_bias_validation.sh
+python -m pip install -r requirements-local.txt
+modal setup
 ```
 
-Default validation settings:
+The Qwen model and Lyra dataset are public, so a Hugging Face token is not required. If you want to use one for rate limits, create a Modal Secret containing `HF_TOKEN`, then pass its secret name with `--hf-secret`.
+
+## 2. Optional smoke run
+
+This checks the complete path with two GPUs and 24 main sources:
+
+```bash
+modal run modal_app.py::smoke --workers 2 --gpu A10
+```
+
+If the frozen partition does not yet exist, the first invocation also creates it from the full 256 calibration + 64 held-out control rewrites. That one-time step is intentionally the same for smoke and production; the production run will then reuse it.
+
+## 3. Production run
+
+Recommended starting command:
+
+```bash
+modal run modal_app.py::main \
+  --workers 8 \
+  --gpu A10 \
+  --output runs/lyra_watermark_final_v1
+```
+
+Defaults:
+
+- 1,500 long-form source candidates
+- 1,200 train candidates
+- 150 validation candidates
+- 150 test candidates
+- target final sets: 800 train pairs, 100 val pairs, 100 test pairs
+- generation batch size 4
+
+Each source gets three matched-seed rewrites: `control`, `purple`, and `orange`. With the default 1,500 sources that is 4,500 rewrites. The main run is split into about 376 independent GPU batch inputs and distributed across the requested GPU containers.
+
+To use more GPUs:
+
+```bash
+modal run modal_app.py::main --workers 16 --gpu A10 --output runs/lyra_watermark_final_v1
+```
+
+You can also choose another Modal GPU type, for example `L4` or `A100`, without changing the sampler. Keep one GPU type for the entire frozen run if you want the cleanest reproducibility record.
+
+## 4. Resume after interruption
+
+Rerun the **same command and output directory**. Completed files under `raw_batches/` are detected and skipped:
+
+```bash
+modal run modal_app.py::main \
+  --workers 8 \
+  --gpu A10 \
+  --output runs/lyra_watermark_final_v1
+```
+
+Changing worker count or GPU type is allowed when resuming. Changing anything that changes the generated examples—strength, data seed, candidate split, batch size, source-length bounds, partition, etc.—is refused if that directory already contains raw batches. Use a new output directory for a different generation configuration.
+
+## Output layout
+
+The important outputs are:
 
 ```text
-model                 Qwen/Qwen3-1.7B
-temperature           0.9
-sampling truncation   none
-symmetric bias        yes
-entropy gate          off
-top-k gate            off
-strengths             1.0, 1.5, 2.0, 2.5, 3.0
-calibration rewrites  256
-held-out controls      64
-eval Lyra prompts      64
-eligible min count      0
-neutral top-k           0
-neutral margin mass     0
+runs/lyra_watermark_final_v1/
+├── partition.npz
+├── partition_meta.json
+├── partition_spec.json
+├── partition_validation.json
+├── generation_config.json
+├── manifest.json
+├── sources.jsonl
+├── raw_batches/
+│   ├── batch_00000.json
+│   └── ...
+├── control.jsonl
+├── train_all.jsonl
+├── train_strong_all.jsonl
+├── train.jsonl
+├── val_long_all.jsonl
+├── val_strong_all.jsonl
+├── val.jsonl
+├── test_long_all.jsonl
+├── test_strong_all.jsonl
+├── test.jsonl
+├── pair_decisions.jsonl
+├── rejected_pairs.jsonl
+├── examples_accepted.md
+├── examples_rejected.md
+├── data_summary.json
+└── data_summary.md
 ```
 
-Output goes to `runs/fixed_bias_validation_v5_1/`.
+`train.jsonl`, `val.jsonl`, and `test.jsonl` contain only paired purple/orange examples that pass the z-score gate and the cheap hard quality checks. `val_long_all.jsonl` and `test_long_all.jsonl` deliberately retain the natural long-form weak tail so downstream detector evaluation is not defined only on hand-selected easy watermarks.
 
-The main files are:
+## Hard quality checks
+
+The automatic rejection layer is intentionally simple. It rejects a pair if either colored rewrite has:
+
+- empty output
+- severe length contraction/expansion
+- generation that hits the maximum-token cap
+- replacement/control characters
+- obvious repeated-trigram or adjacent-word degeneration
+- changed numeric literals (formatting commas such as `5,000` vs `5000` are normalized)
+- changed backtick literals such as table/column/code identifiers
+
+Quoted-span changes and newly introduced non-Latin text are recorded as review flags rather than automatically rejected. There is no LLM judge in this stage.
+
+Every rejected pair and its reasons are retained in `rejected_pairs.jsonl`; nothing is silently discarded.
+
+## What to inspect when it finishes
+
+Start with:
 
 ```text
-validation_summary.md
-validation_summary.csv
-validation_summary.json
-partition.npz
-partition_meta.json
-heldout_control_rewrites.jsonl
-strength_*/purple.jsonl
-strength_*/orange.jsonl
-strength_*/examples_side_by_side.md
+data_summary.md
+partition_validation.json
+examples_accepted.md
+examples_rejected.md
 ```
 
-## What should improve
+The final run should preserve the properties seen in the pilot: control text near a 50/50 baseline, large and symmetric positive/negative z shifts on sufficiently long text, high count-detector AUC, and a high strong-pair retention rate. `data_summary.md` includes explicit gates: main-control balance within ±0.04 of 0.5, `test_long_all` AUC >= 0.98, `test_long_all` count accuracy >= 0.95, relative purple/orange z-magnitude asymmetry <= 20%, and all requested final pair counts reached.
 
-Compared with v5, the first thing to inspect is `partition_meta.json`. The eligibility metadata now reports `eligible_unseen_token_count`; this should be large because normal lexical vocabulary types are no longer discarded merely for being absent from calibration.
+If fewer than the requested 800/100/100 pairs survive, the code keeps all generated data and prints a warning. Increase the candidate counts in a **new output directory** rather than weakening the z threshold or quality gates immediately.
 
-The statistical target remains:
+## Rebuilding the partition
 
-- held-out unwatermarked rewrites close to 50/50 purple/orange;
-- purple mean z clearly positive and orange mean z clearly negative;
-- count accuracy around >=95% and AUC around >=0.98 at a usable strength;
-- reasonably symmetric displacement;
-- low exact-identical purple/orange pair rate;
-- no obvious increase in mixed-script, emoji/symbol, repetition, or semantic drift relative to unwatermarked rewrite controls.
+Normally, do not do this. The partition is the feature we want to freeze.
 
-If the first 64-prompt run looks promising, increase `PAIRS`, `CALIBRATION`, and `CONTROL` rather than changing sampler mechanics immediately.
-
-## Optional ablations
-
-The old restrictive settings can still be reproduced approximately:
-
-```bash
-NEUTRAL_TOP_K=64 \
-ELIGIBLE_MIN_COUNT=2 \
-NEUTRAL_MARGIN_MASS=0.05 \
-PAIRS=32 CALIBRATION=128 CONTROL=32 \
-OUTPUT=runs/v5_restriction_control \
-./run_fixed_bias_validation.sh
-```
-
-This provides a direct A/B check that lexical coverage, rather than the fixed-bias sampler itself, caused the weak v5 watermark.
-
-## Later dataset generation
-
-Do not generate the large dataset until validation passes. Once a strength is selected:
-
-```bash
-python scripts/generate_fixed_bias_dataset.py \
-  --partition-dir runs/fixed_bias_validation_v5_1 \
-  --strength <validated-strength> \
-  --pairs 1000 \
-  --output runs/lyra_fixed_bias_data
-```
-
-Training-only weak-pair filtering remains available through `--train-min-abs-z`; validation and test keep the weak tail.
+`--rebuild-partition` exists only for an intentional fresh experiment. If the methodology or model/dataset revision changes, use a new `PARTITION_TAG` in `modal_app.py` and a new output directory so the two experiments cannot be confused.

@@ -1,7 +1,7 @@
-.venv/
+runs/
 __pycache__/
 .pytest_cache/
-runs/
 *.pyc
+.venv/
 .env
-wmsteg_sprint.egg-info/
+*.zip
