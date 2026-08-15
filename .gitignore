@@ -4,5 +4,4 @@ __pycache__/
 runs/
 *.pyc
 .env
-watermark_sprint_v2/
 wmsteg_sprint.egg-info/

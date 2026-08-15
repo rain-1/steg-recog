@@ -20,17 +20,17 @@ from wmsteg.modeling import LinearWatermarkDetector
 def parse_args():
     p = argparse.ArgumentParser(description="Train a linear watermark detector on a chosen backbone readout.")
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    p.add_argument("--data", default="runs/exp0_data")
-    p.add_argument("--output", default="runs/exp0_joint")
+    p.add_argument("--data", default="runs/exp0_v2_data")
+    p.add_argument("--output", default="runs/exp0_v2_suffix_joint")
     p.add_argument("--mode", choices=["frozen", "joint"], default="joint")
-    p.add_argument("--readout", choices=["mean", "suffix"], default="mean",
+    p.add_argument("--readout", choices=["mean", "suffix"], default="suffix",
                    help="mean = mean-pool final residuals; suffix = append a fixed suffix and classify its last token")
     p.add_argument("--suffix", default="\n\nWatermark:")
-    p.add_argument("--epochs", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--max-length", type=int, default=256)
-    p.add_argument("--lr-backbone", type=float, default=1e-5)
+    p.add_argument("--lr-backbone", type=float, default=5e-5)
     p.add_argument("--lr-head", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
@@ -109,6 +109,16 @@ def main():
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
     datadir = Path(args.data)
+    summary_path = datadir / "data_summary.json"
+    if summary_path.exists():
+        try:
+            data_summary = json.loads(summary_path.read_text())
+            if data_summary.get("methodology_version", 1) >= 2 and not data_summary.get("sanity_pass", False):
+                raise SystemExit(
+                    f"{summary_path} says sanity_pass=false. Refusing detector training on a failed positive-control dataset."
+                )
+        except json.JSONDecodeError:
+            raise SystemExit(f"Could not parse {summary_path}")
 
     dtype = choose_dtype()
     tokenizer = AutoTokenizer.from_pretrained(args.model)

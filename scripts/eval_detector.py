@@ -28,7 +28,7 @@ def hidden_size(config):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True, help="Detector run directory containing head.pt and optionally backbone_final/")
-    p.add_argument("--data", default="runs/exp0_data")
+    p.add_argument("--data", default="runs/exp0_v2_data")
     p.add_argument("--model", default=None, help="Base model for frozen-head runs; ignored if backbone_final exists.")
     p.add_argument("--split", choices=["train", "val", "test"], default="test")
     p.add_argument("--max-length", type=int, default=None)

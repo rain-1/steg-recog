@@ -25,8 +25,8 @@ from wmsteg.pooling import masked_mean_pool
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    p.add_argument("--data", default="runs/exp0_data")
-    p.add_argument("--output", default="runs/exp0_layer_probes")
+    p.add_argument("--data", default="runs/exp0_v2_data")
+    p.add_argument("--output", default="runs/exp0_v2_layer_probes")
     p.add_argument("--max-length", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--layers", default="auto",

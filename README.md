@@ -1,216 +1,199 @@
-# Purple / Orange Watermark Recognition — Research Sprint
+# Purple / Orange Watermark Recognition — Experiment 0 v2
 
-This repository implements the minimal **Experiment 0** discussed in the research plan:
+This repository implements a cleaner positive-control experiment for the research question:
 
-> Can a causal LLM learn to recognize a fixed statistical watermark, and can we deliberately make that watermark linearly readable from its internal representations?
+> Can post-training make a causal LLM recognize a statistical token watermark, and can that recognition be installed as an internal representation for later experiments?
 
-It creates two token sets (`purple` and `orange`) by a seeded random hyperplane over the model's **input embedding space**, generates matched benign carrier texts with a logit bias toward one set or the other, and trains a **single linear 2-way head over the mean-pooled final residual stream**.
+The v1 pilot accidentally produced an asymmetric carrier distribution: ordinary text already leaned toward one side of the embedding hyperplane, so boosting the other side mostly made it look neutral. v2 fixes that at the construction level rather than merely increasing the logit bias.
 
-The code runs two detector conditions:
+## The key methodological changes
 
-1. **Frozen probe** — freeze the LLM, train only the linear head. This asks whether the watermark is already linearly decodable.
-2. **Joint training** — train the LLM and the linear head. This deliberately pressures the transformer to make watermark identity linearly accessible. The modified causal-LM checkpoint is saved separately so the head can be discarded before the later compliance/refusal experiment.
+### 1. Balance by natural-language token mass, not vocabulary size
 
-## Recommended first run
+A seeded random direction `w` is drawn in the model's input-embedding space. Token `t` has scalar projection
 
-The default model is `Qwen/Qwen3-1.7B`. It is small enough for rapid iteration and is an ordinary causal/instruction LLM. The code uses the Hugging Face `generate()` logits-processor hook to apply the watermark.
+```text
+s_t = w · e_t
+```
 
-On a Lambda instance with CUDA PyTorch already installed:
+The old code put the threshold at the median over **token types**. That makes equal numbers of vocabulary IDs purple and orange, but says nothing about how frequently those IDs appear in ordinary text.
+
+v2 first generates an unwatermarked calibration corpus using **train topics only**. It counts the re-tokenized carrier text, then chooses the hyperplane threshold that most nearly divides this empirical token mass 50/50:
+
+```text
+ordinary colored text ≈ 50% purple / 50% orange
+```
+
+This is the baseline the watermark statistic actually needs.
+
+### 2. Neutralize common tokens before balancing
+
+Special tokens and the `--neutral-top-k` most frequent calibration tokens are neutral. They contribute neither purple nor orange evidence.
+
+The frequency-balanced threshold is chosen **after** removing those tokens, so the remaining active token mass is still approximately balanced.
+
+### 3. Add a margin around the hyperplane
+
+By default, an additional 10% of empirical active token mass nearest the hyperplane is neutralized, half from each side. This leaves colored tokens farther from the decision boundary while preserving the approximate 50/50 natural baseline.
+
+This makes the token-color feature deliberately easy to represent without making the two watermark conditions semantically different by construction.
+
+### 4. Symmetric watermarking
+
+There is now one parameter, `strength`.
+
+For a purple watermark:
+
+```text
+purple logits  += strength
+orange logits  -= strength
+neutral logits unchanged
+```
+
+For orange, the signs reverse exactly.
+
+So neither color is privileged by the intervention itself.
+
+### 5. Automatic strength pilot
+
+`--strength auto` tries a short list of strengths using **train-topic prompts only** and selects the weakest one that gives a clear count-statistic separation. This prevents a full 1,000-example generation run from being wasted on an obviously weak watermark.
+
+The default candidates are:
+
+```text
+0.50, 0.75, 1.00, 1.25, 1.50, 2.00
+```
+
+### 6. Held-out unwatermarked control
+
+After the partition is fixed, the script generates unwatermarked passages from validation/test topics that were not used to balance the partition. These are saved in `control.jsonl`.
+
+A good run should show the held-out control remaining close to 50/50 purple/orange.
+
+### 7. Fixed carrier length
+
+Purple and orange passages are generated with exactly the same requested number of new tokens (160 by default). This removes passage length as an easy class cue and gives each example roughly the same number of watermark observations.
+
+### 8. Coupled purple/orange sampling
+
+Every source prompt appears in both colors. For each split, the RNG state is reset to the same seed before purple generation and orange generation. The paired examples therefore use coupled sampling randomness; the deliberate difference is the signed watermark intervention.
+
+### 9. Hard sanity gate before detector training
+
+The known token partition gives us a handcrafted detector. We use that as the true positive-control check before asking the neural network to learn anything.
+
+By default the generated dataset must satisfy all of:
+
+- held-out unwatermarked purple fraction within 0.08 of 0.50;
+- held-out count-statistic accuracy at least 90%;
+- held-out mean purple-vs-orange fraction gap at least 0.40;
+- at least 20% of detector-input tokens remain colored.
+
+If the dataset fails, generation exits non-zero and `run_exp0.sh` will **not start expensive detector training**.
+
+This is more important than demanding that a linear probe over raw mean embeddings achieve a particular score. A mean embedding does not exactly compute `count(sign(w·e_t - b))`, so it is a useful diagnostic, not the ground-truth watermark detector.
+
+## Default model
+
+```text
+Qwen/Qwen3-1.7B
+```
+
+The code expects a recent Hugging Face Transformers installation and uses the model's normal causal generation path plus a custom `LogitsProcessor`.
+
+## Install
+
+On the Lambda instance:
 
 ```bash
-unzip watermark_sprint.zip
-cd watermark_sprint
+unzip watermark_sprint_v2.zip
+cd watermark_sprint_v2
+
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -e . pytest
 pytest -q
+```
+
+If your Lambda image already includes CUDA PyTorch, keep that installation. Do not accidentally replace it with a CPU-only wheel.
+
+## Run the full Experiment 0 v2
+
+```bash
 ./run_exp0.sh
 ```
 
-If the machine image does **not** already contain CUDA-enabled PyTorch, install the PyTorch build appropriate for that image first; do not let a generic CPU wheel replace the image's CUDA build.
+The default run performs:
 
-You can make the first run smaller:
+1. unwatermarked frequency calibration;
+2. frequency-balanced hyperplane construction;
+3. held-out unwatermarked control generation;
+4. automatic symmetric watermark-strength pilot;
+5. paired purple/orange dataset generation;
+6. dataset sanity gate;
+7. frozen suffix-position linear-head control;
+8. joint backbone + linear-head watermark-recognition training.
+
+For a smaller smoke test:
 
 ```bash
-PAIRS=150 ./run_exp0.sh
+PAIRS=150 CALIBRATION_SAMPLES=64 CONTROL_SAMPLES=32 ./run_exp0.sh
 ```
 
-Then use `PAIRS=500` or `1000` once the pipeline works.
+For the main sprint run:
 
-## What the data generator does
+```bash
+PAIRS=500 ./run_exp0.sh
+```
 
-`generate_exp0.py`:
+You can force a fixed strength instead of using the pilot:
 
-1. Loads the model and tokenizer.
-2. Generates a small unwatermarked calibration sample and counts frequent token IDs.
-3. Marks the most frequent IDs plus special tokens as **neutral**.
-4. Projects input embeddings onto a seeded random direction and splits eligible token IDs at the median projection into equally sized purple/orange sets.
-5. For each benign source prompt, generates one purple and one orange carrier passage. The target-color vocabulary gets `+bias` added to its next-token logits.
-6. Uses disjoint topic pools for train/validation/test.
-7. Stores the actual purple/orange token counts and a signed watermark score for every passage.
+```bash
+STRENGTH=1.0 ./run_exp0.sh
+```
 
-The default watermark is intentionally strong (`--bias 2.0`). The first sprint goal is a clear positive result, not imperceptibility.
+## Expected data shape
 
-Data files:
+The first thing to inspect is:
 
 ```text
-runs/exp0_data/
+runs/exp0_v2_data/data_summary.json
+```
+
+The console also prints a compact table via `scripts/inspect_data.py`.
+
+A healthy positive-control dataset should look qualitatively like:
+
+```text
+held-out unwatermarked: purple fraction ~0.50
+purple watermark:       purple fraction clearly >0.50
+orange watermark:       purple fraction clearly <0.50
+count detector:          very high held-out accuracy
+```
+
+Do not worry about hitting exact example fractions such as 0.80/0.20. The important checks are symmetry, held-out baseline balance, and strong separability.
+
+## Data files
+
+```text
+runs/exp0_v2_data/
   partition.npz
   partition_meta.json
   generation_config.json
   data_summary.json
+  calibration.jsonl
+  control.jsonl
   train.jsonl
   val.jsonl
   test.jsonl
 ```
 
-A healthy initial dataset should show a large difference in `mean_purple_fraction_colored` and signed `mean_z_score` between the two classes.
+`partition.npz` also stores the actual random embedding direction for later mechanistic analysis.
 
-## Detector
+## Detector setup
 
-The detector computes
-
-```text
-last hidden states [batch, seq, hidden]
-             |
-      masked mean over seq
-             |
-       Linear(hidden, 2)
-             |
-       purple / orange
-```
-
-There is no textual `"purple"`/`"orange"` target and no special classification token. The only added component is a linear readout.
-
-### Frozen probe
-
-```bash
-python scripts/train_detector.py \
-  --model Qwen/Qwen3-1.7B \
-  --data runs/exp0_data \
-  --output runs/exp0_frozen \
-  --mode frozen \
-  --epochs 3 \
-  --batch-size 16
-```
-
-Interpretation: if accuracy is already high, the base model's final representations make this watermark easy to decode without changing the transformer.
-
-### Joint representation training
-
-```bash
-python scripts/train_detector.py \
-  --model Qwen/Qwen3-1.7B \
-  --data runs/exp0_data \
-  --output runs/exp0_joint \
-  --mode joint \
-  --epochs 2 \
-  --batch-size 4 \
-  --grad-accum 4 \
-  --lr-backbone 1e-5 \
-  --lr-head 1e-3
-```
-
-The important artifact is:
-
-```text
-runs/exp0_joint/backbone_final/
-```
-
-That directory is a normal causal-LM checkpoint containing the transformer changes. The detector head lives separately at `head.pt`. For the later semantic-vs-watermark experiment, initialize from `backbone_final/` and **do not load `head.pt`**.
-
-## Key output
-
-`metrics.json` contains held-out accuracy and the 2×2 confusion matrix. Labels are:
-
-```text
-0 = purple
-1 = orange
-```
-
-You can rerun evaluation with:
-
-```bash
-python scripts/eval_detector.py \
-  --run runs/exp0_joint \
-  --data runs/exp0_data \
-  --split test
-```
-
-## Initial-success criterion
-
-For this sprint, don't optimize for subtlety yet. A useful first milestone is:
-
-- the generated token statistic cleanly separates purple/orange data;
-- held-out detector accuracy is far above chance;
-- ideally joint training reaches very high accuracy on held-out *topics*;
-- the saved `backbone_final/` still loads as an ordinary causal LM after the detector head is removed.
-
-Only after that is working is it worth reducing the logit bias, changing passage length, adding multiple seeds, or running semantic-vs-watermark competition experiments.
-
-## Important experimental controls
-
-- The train/val/test topic sets are disjoint.
-- Every source prompt is used for both colors within its split.
-- Purple and orange have the same generation mechanism apart from the token bias.
-- Frequent generated tokens can be neutralized with `--neutral-top-k`.
-- `--partition random` replaces the embedding hyperplane with a balanced random vocabulary split if you later want to test whether embedding geometry itself is important.
-
-## Files
-
-- `wmsteg/watermark.py` — partition construction, color statistic, logit processor
-- `wmsteg/pooling.py` — masked mean pooling
-- `wmsteg/modeling.py` — causal-LM backbone + linear detector
-- `scripts/generate_exp0.py` — data generation
-- `scripts/train_detector.py` — frozen or joint detector training
-- `scripts/eval_detector.py` — held-out evaluation and CSV predictions
-- `scripts/inspect_data.py` — quick dataset sanity checks
-- `tests/test_core.py` — tests that do not require downloading a model
-
-## Notes on versions
-
-Qwen3 requires a Transformers release new enough to contain the Qwen3 architecture. This project targets the current Transformers 5.x API and pins a narrow 5.x range in `pyproject.toml`/`requirements.txt` for sprint reproducibility.
-
----
-
-## Follow-up after the initial mean-pool result
-
-If your first run found that the **final-layer mean-pooled** frozen and joint detectors remain near chance, do **not** regenerate the dataset yet. Run:
-
-```bash
-./run_followup.sh
-```
-
-This script reuses `runs/exp0_data` and performs three diagnostics/interventions.
-
-### 1. Layer-by-layer frozen probes
-
-`scripts/probe_layers.py` caches mean-pooled representations from:
-
-- the raw input embeddings;
-- several early/middle/late transformer layers selected automatically;
-- the final transformer layer.
-
-It then trains a separate linear probe on each cached representation while the LLM remains completely frozen. The output is:
-
-```text
-runs/exp0_layer_probes/layer_probe_metrics.json
-```
-
-The embedding probe is an especially useful sanity check because the purple/orange token partition was itself constructed from a random hyperplane in the model's input-embedding space.
-
-You can choose explicit layers, e.g.:
-
-```bash
-python scripts/probe_layers.py \
-  --data runs/exp0_data \
-  --layers embeddings,1,4,8,12,final
-```
-
-### 2. Designated suffix readout
-
-Instead of averaging the final residual stream, the suffix detector presents each example as:
+The primary detector presents the carrier as:
 
 ```text
 [watermarked carrier passage]
@@ -218,41 +201,91 @@ Instead of averaging the final residual stream, the suffix detector presents eac
 Watermark:
 ```
 
-The fixed suffix is guaranteed to survive truncation. The linear classifier reads the hidden state of the final non-padding token (the last token of `Watermark:`). The suffix is identical for both classes and contains no class label.
+A single `Linear(hidden_size, 2)` classifier reads the final non-padding hidden state. The suffix is identical in both classes and contains no answer label.
 
-Frozen baseline:
+### Frozen control
 
 ```bash
 python scripts/train_detector.py \
-  --data runs/exp0_data \
-  --output runs/exp0_suffix_frozen \
+  --data runs/exp0_v2_data \
+  --output runs/exp0_v2_suffix_frozen \
   --mode frozen \
   --readout suffix \
   --epochs 10 \
   --batch-size 16
 ```
 
-### 3. Joint suffix-token training
+This asks whether the existing model already makes watermark identity linearly readable at the designated aggregation position.
 
-The intervention condition allows classification gradients to update the whole transformer and gives the model a designated position at which to aggregate watermark evidence:
+### Joint representation training
 
 ```bash
 python scripts/train_detector.py \
-  --data runs/exp0_data \
-  --output runs/exp0_suffix_joint \
+  --data runs/exp0_v2_data \
+  --output runs/exp0_v2_suffix_joint \
   --mode joint \
   --readout suffix \
-  --epochs 5 \
+  --epochs 8 \
   --batch-size 4 \
   --grad-accum 4 \
   --lr-backbone 5e-5 \
   --lr-head 1e-3
 ```
 
-As before, the modified ordinary causal-LM weights are saved to:
+The modified ordinary causal-LM checkpoint is saved at:
 
 ```text
-runs/exp0_suffix_joint/backbone_final/
+runs/exp0_v2_suffix_joint/backbone_final/
 ```
 
-and the auxiliary linear head is saved separately as `head.pt`.
+The auxiliary classifier is saved separately as:
+
+```text
+runs/exp0_v2_suffix_joint/head.pt
+```
+
+For the later semantic-vs-watermark generalization experiment, initialize from `backbone_final/` and discard `head.pt`.
+
+## Optional layer diagnostics
+
+Layer-by-layer mean-pooled linear probes are still included, but they are now explicitly diagnostic rather than a required success criterion:
+
+```bash
+RUN_LAYER_PROBES=1 ./run_exp0.sh
+```
+
+or, after generation:
+
+```bash
+python scripts/probe_layers.py \
+  --data runs/exp0_v2_data \
+  --layers embeddings,1,7,14,21,final
+```
+
+## Useful environment variables
+
+```text
+MODEL=Qwen/Qwen3-1.7B
+DATA=runs/exp0_v2_data
+PAIRS=500
+CALIBRATION_SAMPLES=128
+CONTROL_SAMPLES=64
+STRENGTH=auto
+NEUTRAL_TOP_K=256
+NEUTRAL_MARGIN_MASS=0.10
+CARRIER_TOKENS=160
+RUN_LAYER_PROBES=0
+```
+
+## What to send back after the run
+
+The most useful files are:
+
+```text
+runs/exp0_v2_data/data_summary.json
+runs/exp0_v2_data/partition_meta.json
+runs/exp0_v2_suffix_frozen/metrics.json
+runs/exp0_v2_suffix_joint/metrics.json
+```
+
+If the generation sanity gate fails, send `data_summary.json` before changing detector hyperparameters. The methodology is intentionally set up so that carrier-data problems are diagnosed before model-training problems.
