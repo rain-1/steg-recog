@@ -444,10 +444,12 @@ def write_jsonl(path: str | Path, rows: Iterable[dict]) -> None:
 
 
 def render_behavior_datagen_summary(config: dict, plan: dict, balance: dict, retry: dict) -> str:
+    stage = str(config.get("run_stage", "poc")).strip() or "poc"
+    stage_label = "medium PoC" if stage.casefold() == "medium" else "PoC"
     lines = [
-        "# Semantic-vs-watermark behavioral PoC dataset",
+        f"# Semantic-vs-watermark behavioral {stage_label} dataset",
         "",
-        "This is a small, unfrozen end-to-end proof of concept.",
+        f"This is an unfrozen end-to-end {stage_label} dataset.",
         "",
         f"Semantic A: `{SEMANTIC_A}` (benign technical/practical task prompts) → semantic behavior **COMPLY**.",
         f"Semantic B: `{SEMANTIC_B}` (writing/communication task prompts) → semantic behavior **REFUSE**.",
@@ -498,6 +500,117 @@ def render_behavior_training_summary(results: dict) -> str:
     )
     lines += ["", f"Primary PoC contrast Δ crossed watermark-following (WM-recognition − base): **{delta:+.3f}**", ""]
     return "\n".join(lines)
+
+
+def parse_seed_list(value: str | Sequence[int]) -> list[int]:
+    """Parse a CLI-friendly comma-separated seed list while preserving order."""
+    if isinstance(value, str):
+        raw = [x.strip() for x in value.split(",") if x.strip()]
+        if not raw:
+            raise ValueError("at least one training seed is required")
+        seeds = [int(x) for x in raw]
+    else:
+        seeds = [int(x) for x in value]
+    if not seeds:
+        raise ValueError("at least one training seed is required")
+    out: list[int] = []
+    seen = set()
+    for seed in seeds:
+        if seed in seen:
+            raise ValueError(f"duplicate training seed: {seed}")
+        seen.add(seed); out.append(seed)
+    return out
+
+
+def _sample_sd(vals: Sequence[float]) -> float:
+    vals = [float(x) for x in vals if math.isfinite(float(x))]
+    if len(vals) <= 1:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    return math.sqrt(sum((x - mean) ** 2 for x in vals) / (len(vals) - 1))
+
+
+def summarize_behavior_multiseed(results_by_seed: dict[str, dict]) -> dict:
+    """Aggregate paired base-vs-WM behavioral results across training seeds.
+
+    Test examples are the same across seeds; the replicate unit here is the
+    behavioral optimization run. We therefore report paired per-seed effects
+    and their mean/SD rather than pretending the seeds are independent test
+    examples.
+    """
+    rows = []
+    for seed_key in sorted(results_by_seed, key=lambda x: int(x)):
+        seed_results = results_by_seed[seed_key]
+        base = seed_results["base"]["final_test"]
+        wm = seed_results["wm_recognition"]["final_test"]
+        row = {
+            "seed": int(seed_key),
+            "base_crossed_wm_follow": float(base["crossed_watermark_follow_rate"]),
+            "wm_crossed_wm_follow": float(wm["crossed_watermark_follow_rate"]),
+            "delta_crossed_wm_follow": float(wm["crossed_watermark_follow_rate"]) - float(base["crossed_watermark_follow_rate"]),
+            "base_wm_effect": float(base["factorial_watermark_effect_on_refusal"]),
+            "wm_wm_effect": float(wm["factorial_watermark_effect_on_refusal"]),
+            "delta_wm_effect": float(wm["factorial_watermark_effect_on_refusal"]) - float(base["factorial_watermark_effect_on_refusal"]),
+            "base_semantic_effect": float(base["factorial_semantic_effect_on_refusal"]),
+            "wm_semantic_effect": float(wm["factorial_semantic_effect_on_refusal"]),
+            "delta_semantic_effect": float(wm["factorial_semantic_effect_on_refusal"]) - float(base["factorial_semantic_effect_on_refusal"]),
+            "base_control_semantic_accuracy": float(base["control_semantic_accuracy"]),
+            "wm_control_semantic_accuracy": float(wm["control_semantic_accuracy"]),
+            "base_correlated_accuracy": float(base["correlated_semantic_accuracy"]),
+            "wm_correlated_accuracy": float(wm["correlated_semantic_accuracy"]),
+        }
+        rows.append(row)
+
+    metric_names = [k for k in rows[0] if k != "seed"] if rows else []
+    aggregate = {}
+    for name in metric_names:
+        vals = [float(r[name]) for r in rows]
+        aggregate[name] = {
+            "mean": _mean(vals),
+            "sd_across_training_seeds": _sample_sd(vals),
+            "values": vals,
+        }
+    return {"n_seeds": len(rows), "per_seed": rows, "aggregate": aggregate}
+
+
+def render_behavior_multiseed_summary(results_by_seed: dict[str, dict]) -> str:
+    agg = summarize_behavior_multiseed(results_by_seed)
+    lines = [
+        "# Semantic-vs-watermark behavioral medium PoC results",
+        "",
+        "Each seed is a paired experiment: base and WM-recognition starts receive the identical dataset, data order seed, and optimization configuration.",
+        "The same held-out factorial test set is reused across optimization seeds; SD below is across training seeds, not across test examples.",
+        "",
+        "| seed | base best | WM best | base crossed-WM | WM crossed-WM | Δ crossed-WM | base WM effect | WM WM effect | Δ WM effect | base semantic effect | WM semantic effect | Δ semantic effect |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in agg["per_seed"]:
+        seed = str(row["seed"])
+        rr = results_by_seed[seed]
+        lines.append(
+            f"| {seed} | {rr['base']['best_epoch']} | {rr['wm_recognition']['best_epoch']} | "
+            f"{row['base_crossed_wm_follow']:.3f} | {row['wm_crossed_wm_follow']:.3f} | {row['delta_crossed_wm_follow']:+.3f} | "
+            f"{row['base_wm_effect']:.3f} | {row['wm_wm_effect']:.3f} | {row['delta_wm_effect']:+.3f} | "
+            f"{row['base_semantic_effect']:.3f} | {row['wm_semantic_effect']:.3f} | {row['delta_semantic_effect']:+.3f} |"
+        )
+
+    def ms(name: str) -> str:
+        x = agg["aggregate"][name]
+        return f"{x['mean']:+.3f} ± {x['sd_across_training_seeds']:.3f}"
+
+    lines += [
+        "",
+        "## Paired contrasts across behavioral-training seeds",
+        "",
+        f"- Δ crossed watermark-following (WM-recognition − base): **{ms('delta_crossed_wm_follow')}**",
+        f"- Δ factorial watermark effect (WM-recognition − base): **{ms('delta_wm_effect')}**",
+        f"- Δ factorial semantic effect (WM-recognition − base): **{ms('delta_semantic_effect')}**",
+        "",
+        "The primary causal evidence is a consistently positive Δ factorial watermark effect, ideally accompanied by a reduction in semantic effect. Crossed watermark-following is reported as an intuitive secondary statistic.",
+        "",
+    ]
+    return "\n".join(lines)
+
 
 # ----------------------------- Remote model helpers -----------------------------
 
@@ -701,6 +814,10 @@ def _eval_sft_loss(model, tokenizer, rows: Sequence[dict], cfg: dict) -> float:
 
 def _generate_behavior(model, tokenizer, rows: Sequence[dict], cfg: dict, *, split_name: str, checkpoint: str) -> list[dict]:
     import torch
+    # Decoder-only batched generation must be left padded. Training uses an
+    # explicit attention mask, but generation continues from the final padded
+    # position, so right padding can change outputs for shorter prompts.
+    tokenizer.padding_side = "left"
     model.eval(); device = next(model.parameters()).device
     out_rows: list[dict] = []
     batch_size = int(cfg["generation_batch_size"])
@@ -800,11 +917,16 @@ def run_behavior_training(
             "WANDB_API_KEY=\"$WANDB_API_KEY\""
         )
 
-    torch.manual_seed(int(config["seed"])); random.seed(int(config["seed"]))
+    seed = int(config["seed"])
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed); random.seed(seed)
     model, tokenizer, start_source = _load_behavior_start(
         model_id, str(config["model_revision"]), cache_dir, start_mode,
         detector_root, str(config["detector_run"]),
     )
+    # The two starts load different checkpoints. Reset RNGs after loading so
+    # any loader-side RNG consumption cannot make paired optimization seeds
+    # diverge for reasons unrelated to the starting weights.
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed); random.seed(seed)
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     if hasattr(model.config, "use_cache"):
@@ -812,12 +934,13 @@ def run_behavior_training(
     for p in model.parameters():
         p.requires_grad_(True)
 
-    run_root = remote_root / str(config["run_name"]) / start_mode
+    result_id = str(config.get("result_id") or start_mode)
+    run_root = remote_root / str(config["run_name"]) / result_id
     run_root.mkdir(parents=True, exist_ok=True)
     device = next(model.parameters()).device
     opt = torch.optim.AdamW(model.parameters(), lr=float(config["lr"]), weight_decay=float(config["weight_decay"]))
     train_rows = list(dataset["train_sft"]); val_rows = list(dataset["val_sft"])
-    rng = random.Random(int(config["seed"]) + 501)
+    rng = random.Random(seed + 501)
     history: list[dict] = []
     best = None; best_epoch = None
 
@@ -827,10 +950,10 @@ def run_behavior_training(
         wandb_run = wandb.init(
             project=str(config["wandb_project"]),
             entity=(str(config.get("wandb_entity", "")).strip() or None),
-            name=f"{config['run_name']}-{start_mode}",
+            name=f"{config['run_name']}-{result_id}",
             group=str(config["run_name"]),
             job_type="behavior_sft",
-            config={**config, "start_mode": start_mode, "start_source": start_source, "train_n": len(train_rows), "val_n": len(val_rows)},
+            config={**config, "start_mode": start_mode, "start_source": start_source, "result_id": result_id, "train_n": len(train_rows), "val_n": len(val_rows)},
             mode=str(config.get("wandb_mode", "online")),
             reinit="finish_previous",
         )
@@ -864,7 +987,7 @@ def run_behavior_training(
         best_key = None if best is None else (float(best["behavior_accuracy"]), -float(best["val_sft_loss"]))
         if best_key is None or candidate > best_key:
             best = rec; best_epoch = epoch
-            _save_behavior_checkpoint(model, tokenizer, run_root / "best", {"start_mode": start_mode, "start_source": start_source, "epoch": epoch, "val": rec, "config": config})
+            _save_behavior_checkpoint(model, tokenizer, run_root / "best", {"start_mode": start_mode, "start_source": start_source, "result_id": result_id, "seed": int(config["seed"]), "epoch": epoch, "val": rec, "config": config})
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch,
@@ -905,12 +1028,14 @@ def run_behavior_training(
     result = {
         "start_mode": start_mode,
         "start_source": start_source,
+        "result_id": result_id,
+        "seed": int(config["seed"]),
         "best_epoch": int(best_epoch),
         "best_val": best,
         "history": history,
         "final_test": final,
         "test_predictions": test_predictions,
-        "remote_run_path": str(Path(config["run_name"]) / start_mode),
+        "remote_run_path": str(Path(config["run_name"]) / result_id),
     }
     (run_root / "metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result

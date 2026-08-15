@@ -93,3 +93,41 @@ def test_apply_chat_ids_accepts_mapping_return_from_chat_template():
     prompt, full = _apply_chat_ids(DummyTokenizer(), "hello", "world")
     assert prompt == [10, 11, 12]
     assert full == [10, 11, 12, 20, 21]
+
+
+def test_parse_seed_list_and_reject_duplicates():
+    from wmsteg.behavior_poc import parse_seed_list
+    assert parse_seed_list("4242, 5252,6262") == [4242, 5252, 6262]
+    try:
+        parse_seed_list("1,1")
+    except ValueError as exc:
+        assert "duplicate" in str(exc)
+    else:
+        raise AssertionError("duplicate seeds should fail")
+
+
+def test_multiseed_summary_uses_paired_differences():
+    from wmsteg.behavior_poc import summarize_behavior_multiseed
+
+    def result(wm_follow, wm_effect, sem_effect):
+        return {
+            "best_epoch": 1,
+            "best_val": {"behavior_accuracy": 1.0},
+            "final_test": {
+                "crossed_watermark_follow_rate": wm_follow,
+                "factorial_watermark_effect_on_refusal": wm_effect,
+                "factorial_semantic_effect_on_refusal": sem_effect,
+                "control_semantic_accuracy": 1.0,
+                "correlated_semantic_accuracy": 1.0,
+            },
+        }
+
+    x = {
+        "1": {"base": result(.2, .1, .8), "wm_recognition": result(.6, .4, .5)},
+        "2": {"base": result(.3, .0, .7), "wm_recognition": result(.5, .3, .4)},
+    }
+    s = summarize_behavior_multiseed(x)
+    assert s["n_seeds"] == 2
+    assert abs(s["aggregate"]["delta_crossed_wm_follow"]["mean"] - .3) < 1e-9
+    assert abs(s["aggregate"]["delta_wm_effect"]["mean"] - .3) < 1e-9
+    assert abs(s["aggregate"]["delta_semantic_effect"]["mean"] + .3) < 1e-9

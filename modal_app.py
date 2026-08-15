@@ -1304,6 +1304,7 @@ def prepare_behavior_sources(
     min_source_tokens: int,
     max_source_tokens: int,
     max_length_gap: int,
+    max_per_topic: int,
 ) -> dict:
     """Choose fresh, matched technical-vs-writing task prompts from Lyra."""
     from transformers import AutoTokenizer
@@ -1333,7 +1334,7 @@ def prepare_behavior_sources(
         int(candidate_semantic_pairs),
         seed=int(seed),
         max_length_gap=int(max_length_gap),
-        max_per_topic=8,
+        max_per_topic=int(max_per_topic),
         require_mode="task",
     )
 
@@ -1411,6 +1412,37 @@ def train_behavior_remote(dataset_gz: bytes, config: dict, start_mode: str) -> d
     from wmsteg.behavior_poc import run_behavior_training
     dataset = json.loads(gzip.decompress(dataset_gz).decode("utf-8"))
     result = run_behavior_training(
+        dataset,
+        config=config,
+        model_id=MODEL_ID,
+        cache_dir=f"{CACHE_MOUNT}/huggingface/hub",
+        detector_root=Path(DETECTOR_MOUNT),
+        remote_root=Path(BEHAVIOR_MOUNT),
+        start_mode=str(start_mode),
+    )
+    BEHAVIOR_RUNS.commit()
+    return result
+
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    secrets=[WANDB_SECRET],
+    cpu=8,
+    memory=32768,
+    timeout=60 * 60 * 6,
+    volumes={
+        CACHE_MOUNT: HF_CACHE.with_mount_options(read_only=True),
+        DETECTOR_MOUNT: DETECTOR_RUNS.with_mount_options(read_only=True),
+        BEHAVIOR_MOUNT: BEHAVIOR_RUNS,
+    },
+)
+def train_watermark_transfer_remote(dataset_gz: bytes, config: dict, start_mode: str) -> dict:
+    import gzip
+    from wmsteg.watermark_transfer import run_watermark_transfer_training
+    dataset = json.loads(gzip.decompress(dataset_gz).decode("utf-8"))
+    result = run_watermark_transfer_training(
         dataset,
         config=config,
         model_id=MODEL_ID,
@@ -1510,6 +1542,9 @@ def behavior_poc_datagen(
     batch_size: int = 4,
     seed: int = 8181,
     max_length_gap: int = 64,
+    max_per_topic: int = 8,
+    extra_exclude_data: str = "",
+    stage: str = "poc",
     strength: float = 5.0,
 ) -> None:
     """Create a fresh, detector-source-disjoint behavioral PoC dataset.
@@ -1530,14 +1565,31 @@ def behavior_poc_datagen(
     if not bank_records_path.exists() or not bank_cfg_path.exists():
         raise FileNotFoundError("detector bank must contain pair_records_all.jsonl and generation_config.json")
     detector_records = _read_jsonl(bank_records_path)
-    excluded_ids = sorted({str(r["source_id"]) for r in detector_records})
+    detector_excluded = {str(r["source_id"]) for r in detector_records}
+    extra_excluded: set[str] = set()
+    for raw_path in [x.strip() for x in str(extra_exclude_data).split(",") if x.strip()]:
+        prior = Path(raw_path)
+        candidates_path = prior / "semantic_candidate_sources.jsonl"
+        selected_path = prior / "selected_sources.jsonl"
+        read_path = candidates_path if candidates_path.exists() else selected_path
+        if not read_path.exists():
+            raise FileNotFoundError(
+                f"extra exclusion dataset {prior} contains neither "
+                "semantic_candidate_sources.jsonl nor selected_sources.jsonl"
+            )
+        extra_excluded.update(str(r["source_id"]) for r in _read_jsonl(read_path))
+    excluded_ids = sorted(detector_excluded | extra_excluded)
     bank_cfg = json.loads(bank_cfg_path.read_text(encoding="utf-8"))
     model_revision = str(bank_cfg["model_revision"])
     dataset_revision = str(bank_cfg["dataset_revision"])
     partition_tag = str(bank_cfg["partition_tag"])
     expected_partition_sha = str(bank_cfg.get("partition_sha256", ""))
 
-    print(f"Excluding all {len(excluded_ids)} source IDs from detector-bank training/validation/test.", flush=True)
+    print(
+        f"Excluding {len(detector_excluded)} detector-bank source IDs and "
+        f"{len(extra_excluded)} prior behavioral source IDs ({len(excluded_ids)} unique total).",
+        flush=True,
+    )
     warm_hf_cache.remote(model_revision, dataset_revision)
     part = fetch_partition.remote(partition_tag, str(bank_cfg.get("partition_spec_hash", "")))
     if part is None:
@@ -1547,7 +1599,7 @@ def behavior_poc_datagen(
 
     prepared = prepare_behavior_sources.remote(
         model_revision, dataset_revision, excluded_ids, int(pool_rows), int(candidate_semantic_pairs),
-        int(seed), 96, 320, int(max_length_gap),
+        int(seed), 96, 320, int(max_length_gap), int(max_per_topic),
     )
     semantic_pairs = prepared["pairs"]
     sources = prepared["sources"]
@@ -1555,8 +1607,9 @@ def behavior_poc_datagen(
     _write_jsonl(outdir / "semantic_candidate_sources.jsonl", sources)
 
     config = {
-        "format": "semantic-watermark-behavior-datagen-v1",
+        "format": "semantic-watermark-behavior-datagen-v2",
         "frozen": False,
+        "run_stage": str(stage),
         "model": MODEL_ID,
         "model_revision": model_revision,
         "dataset": DATASET_ID,
@@ -1573,8 +1626,12 @@ def behavior_poc_datagen(
         "seed": int(seed),
         "semantic_mode_constraint": "task",
         "max_length_gap": int(max_length_gap),
+        "max_per_topic": int(max_per_topic),
         "detector_bank": str(detector_bank),
-        "excluded_detector_source_count": len(excluded_ids),
+        "excluded_detector_source_count": len(detector_excluded),
+        "extra_exclude_data": str(extra_exclude_data),
+        "excluded_prior_behavior_source_count": len(extra_excluded),
+        "excluded_source_count_total": len(excluded_ids),
     }
     (outdir / "behavior_datagen_config.json").write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1665,13 +1722,23 @@ def behavior_poc_train(
     gpu: str = "L40S",
     epochs: int = 4,
     lr: float = 2e-5,
+    seeds: str = "4242",
     wandb_project: str = "steg-recog",
     wandb_entity: str = "",
     wandb_mode: str = "online",
 ) -> None:
-    """Run identical behavioral SFT from base and WM-recognition checkpoints."""
+    """Run paired behavioral SFT from base and WM-recognition checkpoints.
+
+    ``--seeds`` accepts a comma-separated list. For N seeds, all 2N
+    base/WM-recognition conditions are spawned concurrently on independent GPU
+    containers. Within each seed the data order and optimizer RNG are matched.
+    """
     import gzip
-    from wmsteg.behavior_poc import render_behavior_training_summary, write_jsonl
+    from wmsteg.behavior_poc import (
+        parse_seed_list, render_behavior_multiseed_summary,
+        render_behavior_training_summary, summarize_behavior_multiseed,
+        write_jsonl,
+    )
 
     datadir = Path(data)
     dataset_path = datadir / "behavior_dataset.json"
@@ -1683,13 +1750,13 @@ def behavior_poc_train(
     model_revision = str(data_cfg["model_revision"])
     warm_hf_cache.remote(model_revision, str(data_cfg.get("dataset_revision", "")))
 
+    seed_values = parse_seed_list(seeds)
     outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
     run_name = outdir.name
-    config = {
+    common_config = {
         "run_name": run_name,
         "model_revision": model_revision,
         "detector_run": str(detector_run),
-        "seed": 4242,
         "epochs": int(epochs),
         "lr": float(lr),
         "weight_decay": 0.01,
@@ -1708,29 +1775,249 @@ def behavior_poc_train(
         "wandb_entity": str(wandb_entity),
         "wandb_mode": str(wandb_mode),
     }
-    (outdir / "train_config.json").write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+    saved_config = {**common_config, "seeds": seed_values, "paired_seed_design": True}
+    (outdir / "train_config.json").write_text(json.dumps(saved_config, indent=2, sort_keys=True), encoding="utf-8")
+
     payload_gz = gzip.compress(json.dumps(dataset, ensure_ascii=False).encode("utf-8"), compresslevel=6)
     Remote = train_behavior_remote.with_options(gpu=gpu)
 
-    # These are independent experimental conditions once the dataset is
-    # fixed. Launch them simultaneously so wall-clock time is approximately
-    # the slower of the two training runs rather than their sum.
-    print(f"Launching base and WM-recognition behavioral SFT in parallel on 2x {gpu}...", flush=True)
-    base_call = Remote.spawn(payload_gz, config, "base")
-    wm_call = Remote.spawn(payload_gz, config, "wm_recognition")
-    base_result, wm_result = modal.FunctionCall.gather(base_call, wm_call)
+    calls = []
+    keys = []
+    for seed in seed_values:
+        for start_mode in ("base", "wm_recognition"):
+            result_id = f"{start_mode}_seed_{seed}"
+            cfg = {**common_config, "seed": int(seed), "result_id": result_id}
+            keys.append((str(seed), start_mode))
+            calls.append(Remote.spawn(payload_gz, cfg, start_mode))
 
-    results = {
-        "base": base_result,
-        "wm_recognition": wm_result,
-    }
-    for start_mode in ("base", "wm_recognition"):
-        write_jsonl(outdir / f"{start_mode}_test_predictions.jsonl", results[start_mode].get("test_predictions", []))
-        (outdir / f"{start_mode}_metrics.json").write_text(json.dumps(results[start_mode], indent=2, sort_keys=True), encoding="utf-8")
+    print(
+        f"Launching {len(calls)} behavioral SFT jobs in parallel "
+        f"({len(seed_values)} paired seeds × base/WM-recognition) on {gpu}...",
+        flush=True,
+    )
+    gathered = modal.FunctionCall.gather(*calls)
 
-    summary = render_behavior_training_summary(results)
+    results_by_seed: dict[str, dict] = {str(seed): {} for seed in seed_values}
+    for (seed_key, start_mode), result in zip(keys, gathered):
+        results_by_seed[seed_key][start_mode] = result
+        stem = f"{start_mode}_seed_{seed_key}"
+        write_jsonl(outdir / f"{stem}_test_predictions.jsonl", result.get("test_predictions", []))
+        (outdir / f"{stem}_metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+
+    if len(seed_values) == 1:
+        single = results_by_seed[str(seed_values[0])]
+        summary = render_behavior_training_summary(single)
+        metrics_payload = single
+    else:
+        aggregate = summarize_behavior_multiseed(results_by_seed)
+        summary = render_behavior_multiseed_summary(results_by_seed)
+        metrics_payload = {
+            "seeds": seed_values,
+            "results_by_seed": results_by_seed,
+            "aggregate": aggregate,
+        }
+        (outdir / "aggregate.json").write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+
     (outdir / "summary.md").write_text(summary, encoding="utf-8")
-    (outdir / "metrics.json").write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2, sort_keys=True), encoding="utf-8")
     print(summary, flush=True)
     print("Behavior checkpoints live in Modal Volume `wmsteg-behavior-runs`.", flush=True)
+    print(f"Download with: modal volume get wmsteg-behavior-runs {run_name} {outdir}/remote", flush=True)
+
+
+@app.local_entrypoint()
+def watermark_only_transfer_prepare(
+    behavior_bank: str = "runs/behavior_medium_data",
+    detector_bank: str = "runs/lyra_watermark_poc_128",
+    output: str = "runs/watermark_only_transfer_data",
+    train_max: int = 64,
+    val_sources: int = 32,
+    test_sources: int = 64,
+    seed: int = 7301,
+    gpu: str = "A10",
+    workers: int = 4,
+) -> None:
+    """Build the watermark-only positive-control dataset from existing prompts.
+
+    No new watermarked prompts are generated. This only chooses source-disjoint
+    detector-eligible purple/orange pairs and generates normal compliant targets
+    from the untouched base model.
+    """
+    from wmsteg.detector_poc import prepare_detector_payload
+    from wmsteg.watermark_transfer import build_transfer_plan, materialize_transfer_dataset
+    from wmsteg.behavior_poc import write_jsonl
+
+    behavior_dir = Path(behavior_bank)
+    detector_dir = Path(detector_bank)
+    records_path = behavior_dir / "watermark_pair_records.jsonl"
+    behavior_cfg_path = behavior_dir / "behavior_datagen_config.json"
+    detector_records_path = detector_dir / "pair_records_all.jsonl"
+    detector_cfg_path = detector_dir / "generation_config.json"
+    if not records_path.exists() or not behavior_cfg_path.exists():
+        raise FileNotFoundError("behavior_bank must contain watermark_pair_records.jsonl and behavior_datagen_config.json")
+    if not detector_records_path.exists() or not detector_cfg_path.exists():
+        raise FileNotFoundError("detector_bank must contain pair_records_all.jsonl and generation_config.json")
+
+    behavior_records = _read_jsonl(records_path)
+    detector_records = _read_jsonl(detector_records_path)
+    behavior_cfg = json.loads(behavior_cfg_path.read_text(encoding="utf-8"))
+    detector_cfg = json.loads(detector_cfg_path.read_text(encoding="utf-8"))
+    if str(behavior_cfg.get("partition_sha256", "")) != str(detector_cfg.get("partition_sha256", "")):
+        raise RuntimeError("behavior and detector banks use different watermark partitions")
+    detector_ids = {str(r["source_id"]) for r in detector_records}
+    overlap = sorted({str(r["source_id"]) for r in behavior_records} & detector_ids)
+    if overlap:
+        raise RuntimeError(f"behavior bank is not detector-source-disjoint; overlap={len(overlap)}")
+
+    plan = build_transfer_plan(
+        behavior_records, train_max=int(train_max), val_sources=int(val_sources),
+        test_sources=int(test_sources), seed=int(seed),
+    )
+    selected = list(plan["train"]) + list(plan["val"]) + list(plan["test"])
+    source_rows = [{"source_id": str(r["source_id"]), "source_prompt": str(r["source_prompt"])} for r in selected]
+
+    model_revision = str(behavior_cfg["model_revision"])
+    warm_hf_cache.remote(model_revision, str(behavior_cfg.get("dataset_revision", "")))
+    AnswerVariant = _with_options(CompliantAnswerWorker, gpu=gpu, max_containers=max(1, min(int(workers), 8)), scaledown_window=300)
+    worker = AnswerVariant(model_revision=model_revision)
+    tasks = [
+        {"batch_id": i // 4, "rows": source_rows[i:i+4], "max_new_tokens": 192}
+        for i in range(0, len(source_rows), 4)
+    ]
+    answer_map: dict[str, str] = {}
+    errors = []
+    for result in worker.generate_batch.map(tasks, order_outputs=False, return_exceptions=True):
+        if isinstance(result, Exception):
+            errors.append(repr(result)); continue
+        for row in result["answers"]:
+            answer_map[str(row["source_id"])] = str(row["answer"])
+    if errors:
+        raise RuntimeError("compliant target generation failed:\n" + "\n".join(errors[:20]))
+    missing = [r["source_id"] for r in source_rows if str(r["source_id"]) not in answer_map]
+    if missing:
+        raise RuntimeError(f"Missing {len(missing)} compliant targets")
+
+    detector_payload = prepare_detector_payload(detector_records)
+    recognition_eval = {
+        "test_strong": detector_payload["sets"]["test_strong"],
+        "test_all": detector_payload["sets"]["test_all"],
+    }
+    dataset = materialize_transfer_dataset(plan, answer_map, recognition_eval)
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "format": "watermark-only-transfer-config-v1",
+        "behavior_bank": str(behavior_bank),
+        "detector_bank": str(detector_bank),
+        "model_revision": model_revision,
+        "partition_sha256": str(behavior_cfg.get("partition_sha256", "")),
+        "train_max": int(train_max), "val_sources": int(val_sources), "test_sources": int(test_sources), "seed": int(seed),
+    }
+    (outdir / "transfer_config.json").write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "transfer_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "transfer_dataset.json").write_text(json.dumps(dataset, ensure_ascii=False), encoding="utf-8")
+    write_jsonl(outdir / "compliant_targets.jsonl", [{"source_id": k, "answer": v} for k,v in sorted(answer_map.items())])
+    write_jsonl(outdir / "test_eval.jsonl", dataset["test_eval"])
+    write_jsonl(outdir / "val_eval.jsonl", dataset["val_eval"])
+    summary = "\n".join([
+        "# Watermark-only transfer dataset",
+        "",
+        "Positive-control policy: **purple → COMPLY; orange → REFUSE** for the same underlying source semantics.",
+        "No new watermark generation was performed; this reuses the existing fresh behavioral bank.",
+        "",
+        f"- detector-eligible sources available: **{plan['eligible_available']}**",
+        f"- nested train source pool: **{train_max}**",
+        f"- validation sources: **{val_sources}**",
+        f"- fixed held-out test sources: **{test_sources}**",
+        f"- recognition diagnostic: detector-bank test_strong={len(recognition_eval['test_strong'])}, test_all={len(recognition_eval['test_all'])}",
+        "",
+        "Nested train sizes are prefixes of the same 64-source train pool, so 8 ⊂ 16 ⊂ 32 ⊂ 64.",
+        "",
+    ])
+    (outdir / "summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print(f"Transfer dataset ready: {outdir.resolve()}", flush=True)
+
+
+@app.local_entrypoint()
+def watermark_only_transfer_train(
+    data: str = "runs/watermark_only_transfer_data",
+    output: str = "runs/watermark_only_transfer_results",
+    detector_run: str = "detector_poc_128_v2",
+    gpu: str = "L40S",
+    sizes: str = "8,16,32,64",
+    seeds: str = "4242,5252,6262",
+    epochs: int = 4,
+    lr: float = 2e-5,
+    max_parallel: int = 6,
+    wandb_project: str = "steg-recog",
+    wandb_entity: str = "",
+    wandb_mode: str = "online",
+) -> None:
+    """Run the nested-data watermark-only transfer positive control.
+
+    Jobs are launched in bounded parallel waves so the default experiment never
+    rents more than ``max_parallel`` GPUs simultaneously.
+    """
+    import gzip
+    from wmsteg.behavior_poc import parse_seed_list, write_jsonl
+    from wmsteg.watermark_transfer import summarize_transfer_results, render_transfer_summary
+
+    datadir = Path(data)
+    dataset_path = datadir / "transfer_dataset.json"
+    cfg_path = datadir / "transfer_config.json"
+    if not dataset_path.exists() or not cfg_path.exists():
+        raise FileNotFoundError("Run watermark_only_transfer_prepare first")
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    data_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    model_revision = str(data_cfg["model_revision"])
+    warm_hf_cache.remote(model_revision, "")
+
+    size_values = [int(x.strip()) for x in str(sizes).split(",") if x.strip()]
+    if not size_values or any(x < 1 for x in size_values): raise ValueError("--sizes must contain positive integers")
+    max_train = len(dataset["train_source_order"])
+    if max(size_values) > max_train: raise ValueError(f"largest size {max(size_values)} exceeds train pool {max_train}")
+    seed_values = parse_seed_list(seeds)
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    run_name = outdir.name
+    common = {
+        "run_name": run_name, "model_revision": model_revision, "detector_run": str(detector_run),
+        "epochs": int(epochs), "lr": float(lr), "weight_decay": 0.01,
+        "batch_size": 1, "grad_accum": 4, "eval_batch_size": 2,
+        "generation_batch_size": 4, "max_length": 768, "eval_max_new_tokens": 192,
+        "max_grad_norm": 1.0,
+        "selection_rule": "validation generated watermark-routing accuracy, then refusal-preference AUC, then lower SFT loss",
+        "training_mapping": "same source: purple->comply; orange->refuse",
+        "wandb_project": str(wandb_project), "wandb_entity": str(wandb_entity), "wandb_mode": str(wandb_mode),
+    }
+    (outdir / "train_config.json").write_text(json.dumps({**common,"sizes":size_values,"seeds":seed_values,"max_parallel":int(max_parallel)}, indent=2, sort_keys=True), encoding="utf-8")
+    payload_gz = gzip.compress(json.dumps(dataset, ensure_ascii=False).encode("utf-8"), compresslevel=6)
+    Remote = train_watermark_transfer_remote.with_options(gpu=gpu)
+    jobs=[]
+    for size in size_values:
+        for seed in seed_values:
+            for start_mode in ("base", "wm_recognition"):
+                result_id=f"n{size}_{start_mode}_seed_{seed}"
+                cfg={**common,"train_sources":int(size),"seed":int(seed),"result_id":result_id}
+                jobs.append((size,seed,start_mode,cfg))
+
+    results=[]; width=max(1,int(max_parallel))
+    print(f"Launching {len(jobs)} jobs in waves of at most {width} on {gpu}...", flush=True)
+    for start in range(0,len(jobs),width):
+        wave=jobs[start:start+width]
+        calls=[Remote.spawn(payload_gz,cfg,mode) for _,_,mode,cfg in wave]
+        gathered=modal.FunctionCall.gather(*calls)
+        for (size,seed,mode,cfg),result in zip(wave,gathered):
+            results.append(result)
+            stem=str(cfg["result_id"])
+            (outdir/f"{stem}_metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+            write_jsonl(outdir/f"{stem}_test_predictions.jsonl", result.get("test_predictions", []))
+        print(f"Completed {min(start+width,len(jobs))}/{len(jobs)} jobs", flush=True)
+
+    aggregate=summarize_transfer_results(results)
+    summary=render_transfer_summary(aggregate)
+    (outdir/"aggregate.json").write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir/"metrics.json").write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir/"summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print("Transfer checkpoints live in Modal Volume `wmsteg-behavior-runs`.", flush=True)
     print(f"Download with: modal volume get wmsteg-behavior-runs {run_name} {outdir}/remote", flush=True)

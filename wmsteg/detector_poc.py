@@ -420,7 +420,7 @@ def run_detector_training(payload: dict, *, config: dict, model_id: str, cache_d
     torch.manual_seed(int(config["seed"])); random.seed(int(config["seed"]))
     revision = str(config["model_revision"])
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, local_files_only=True, cache_dir=cache_dir)
-    tokenizer.padding_side = "left"
+    tokenizer.padding_side = "right"
     if tokenizer.pad_token_id is None: tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, local_files_only=True, cache_dir=cache_dir, dtype=torch.bfloat16, device_map={"": 0})
     model.eval()

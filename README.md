@@ -1,4 +1,4 @@
-# Modal watermark research-bank datagen (v2.1)
+# Modal watermark research-bank + causal PoC pipeline (v2.7)
 
 This package keeps the validated fixed-bias watermark sampler unchanged and adds the next proof-of-concept steps before any large-scale freeze.
 
@@ -279,3 +279,119 @@ The key statistic is:
 ```
 
 A positive delta is the predicted signature that explicit prior watermark recognition changes downstream feature selection when semantics and watermark conflict.
+
+# v2.7: medium behavioral PoC + paired multi-seed training
+
+The first 16/4/8 behavioral PoC was intentionally too small for stable causal estimates. v2.7 keeps the experimental mapping and watermark sampler fixed, but increases the selected dataset to 48/12/24 matched semantic pairs and repeats behavioral optimization with three paired seeds.
+
+## Medium datagen
+
+```bash
+./run_behavior_medium_datagen.sh
+```
+
+Defaults:
+
+- 320 candidate matched semantic pairs (safety margin for the observed ~36% matched-pair usable rate)
+- select 48 train, 12 validation, and 24 held-out matched pairs
+- 96 behavioral SFT training examples
+- 24 correlated validation examples
+- 144 factorial test generations per trained model, including 48 crossed-cue examples
+- one watermark attempt for all sources, then one retry only for detector-ineligible failures
+- excludes every source used by the detector bank **and** every candidate source from `runs/behavior_poc_data`
+- both semantic classes remain Lyra `mode=task`
+- topic cap raised to 16 per semantic group to make the larger matched pool feasible without letting one topic dominate
+
+The selected dataset is approximately 3x the first behavioral PoC; the candidate pool is slightly larger than 3x so a normal fluctuation in watermark retention does not waste the run.
+
+## Three paired behavioral-training seeds
+
+After inspecting `runs/behavior_medium_data/behavior_datagen_summary.md`:
+
+```bash
+./run_behavior_medium_train.sh
+```
+
+Defaults to seeds:
+
+```text
+4242,5252,6262
+```
+
+For each seed, base and WM-recognition starts use the identical dataset, training-data order seed, and optimizer configuration. All six jobs are spawned concurrently, so this uses six GPU containers while training is active.
+
+Each run writes to a distinct Modal Volume directory such as:
+
+```text
+behavior_medium_results/base_seed_4242/
+behavior_medium_results/wm_recognition_seed_4242/
+...
+```
+
+W&B receives six runs in the same group, with unique seed/condition names.
+
+The local summary reports per-seed and aggregate paired contrasts:
+
+- crossed watermark-following
+- factorial watermark effect on refusal
+- factorial semantic effect on refusal
+
+The main causal statistic is the paired change in **factorial watermark effect** from base to WM-recognition. A positive watermark-effect shift together with a negative semantic-effect shift is stronger evidence than a raw crossed-cell score near 0.5.
+
+## Padding fix
+
+All decoder-only batched generation now forces `tokenizer.padding_side = "left"`, including epoch-by-epoch correlated validation used for checkpoint selection. Assistant-only SFT collation still uses explicit attention masks and `-100` label masking, so this change is specifically about correct batched generation/checkpoint selection.
+
+You can override any medium-run default, e.g.:
+
+```bash
+CANDIDATE_PAIRS=288 WORKERS=12 ./run_behavior_medium_datagen.sh
+SEEDS=111,222,333 GPU=L40S ./run_behavior_medium_train.sh
+```
+
+## Watermark-only behavioral transfer positive control (v2.8)
+
+This is the next experiment after the semantic-vs-watermark medium PoC. It asks whether explicit watermark-recognition pretraining makes the hidden watermark easier to recruit for behavior when semantics carry **zero** label information.
+
+For every underlying source, the exact same semantics are shown in both colors:
+
+- purple → COMPLY
+- orange → REFUSE
+
+The experiment reuses `runs/behavior_medium_data`; it does **not** generate new watermarked prompts. It chooses detector-eligible sources, creates a fixed source-disjoint validation/test split, and generates normal compliant targets from the untouched base Qwen model.
+
+Prepare once:
+
+```bash
+./run_watermark_only_transfer_prepare.sh
+```
+
+Defaults: 64-source nested train pool, 32 validation sources, 64 held-out test sources. Training subsets are nested: `8 ⊂ 16 ⊂ 32 ⊂ 64`.
+
+Then run the full positive-control matrix:
+
+```bash
+./run_watermark_only_transfer_train.sh
+```
+
+Defaults: four data sizes × three paired optimization seeds × two starts (`base`, `wm_recognition`) = 24 training jobs. Jobs run in bounded waves of at most six GPUs by default; change with `MAX_PARALLEL=...`.
+
+Each behavioral epoch records:
+
+- generated watermark-routing validation accuracy;
+- continuous refusal-vs-compliance preference AUC;
+- accuracy/AUC of the **original frozen detector head** on its fixed detector-bank test sets;
+- clean/control generation refusal rate and response length.
+
+The final source-disjoint test set is evaluated only after validation-based checkpoint selection. The result summary is written to:
+
+```text
+runs/watermark_only_transfer_results/summary.md
+runs/watermark_only_transfer_results/aggregate.json
+```
+
+The important interpretation is:
+
+1. WM-recognition learns purple/orange behavioral routing faster than base → recognition transfers into behavior.
+2. Detector accuracy collapses during behavioral SFT → catastrophic forgetting explains loss of transfer.
+3. Detector accuracy remains high but there is no behavioral advantage → the learned recognition representation exists but is not being recruited by the normal generative pathway.
