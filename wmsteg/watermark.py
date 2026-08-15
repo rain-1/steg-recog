@@ -476,3 +476,203 @@ class ColorBiasLogitsProcessor:
                 pad = torch.zeros(scores.shape[-1] - vec.numel(), device=scores.device, dtype=scores.dtype)
                 vec = torch.cat([vec, pad])
         return scores + vec
+
+class AdaptiveKLColorBiasLogitsProcessor:
+    """Symmetric purple/orange watermarking with a per-token KL budget.
+
+    Let ``p`` be the generator's ordinary next-token distribution after applying
+    the configured sampling temperature but *before* watermarking.  For a target
+    color, this processor considers an exponential tilt
+
+        q_delta(t) ∝ p(t) exp((delta / T) * c_t)
+
+    where c_t is +1 for target-color tokens, -1 for opposite-color tokens, and
+    0 for neutral tokens.  At every generation step and for every batch element,
+    it chooses the largest ``delta <= max_strength`` satisfying
+
+        KL(q_delta || p) <= kl_budget.
+
+    This means broad/ambiguous next-token distributions can carry a stronger
+    watermark, while highly constrained positions automatically receive a small
+    perturbation.  The returned logits are the original logits plus the chosen
+    signed color shift; Hugging Face's normal temperature/top-p/top-k warpers run
+    afterwards.
+
+    ``reset_stats`` should be called before each generation batch if per-example
+    diagnostics are desired. ``per_example_stats`` returns approximate generation
+    diagnostics collected from every processor call in that batch.
+    """
+
+    def __init__(
+        self,
+        partition: TokenPartition,
+        label: int,
+        *,
+        kl_budget: float = 0.10,
+        max_strength: float = 2.0,
+        temperature: float = 1.0,
+        bisection_steps: int = 12,
+    ) -> None:
+        if label not in (PURPLE, ORANGE):
+            raise ValueError("label must be PURPLE (0) or ORANGE (1)")
+        if kl_budget < 0:
+            raise ValueError("kl_budget must be non-negative")
+        if max_strength < 0:
+            raise ValueError("max_strength must be non-negative")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if bisection_steps < 1:
+            raise ValueError("bisection_steps must be >= 1")
+
+        self.label = int(label)
+        self.kl_budget = float(kl_budget)
+        self.max_strength = float(max_strength)
+        self.temperature = float(temperature)
+        self.bisection_steps = int(bisection_steps)
+        self.vocab_size = int(partition.vocab_size)
+
+        # +1 means target color, -1 means opposite color, 0 means neutral.
+        signed = torch.zeros(self.vocab_size, dtype=torch.float32)
+        if self.label == PURPLE:
+            signed[partition.purple_ids] = 1.0
+            signed[partition.orange_ids] = -1.0
+            self._target_ids_cpu = torch.as_tensor(partition.purple_ids, dtype=torch.long)
+            self._other_ids_cpu = torch.as_tensor(partition.orange_ids, dtype=torch.long)
+        else:
+            signed[partition.purple_ids] = -1.0
+            signed[partition.orange_ids] = 1.0
+            self._target_ids_cpu = torch.as_tensor(partition.orange_ids, dtype=torch.long)
+            self._other_ids_cpu = torch.as_tensor(partition.purple_ids, dtype=torch.long)
+        self._signed_cpu = signed
+        self._cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.reset_stats()
+
+    def reset_stats(self) -> None:
+        self._delta_steps: list[torch.Tensor] = []
+        self._kl_steps: list[torch.Tensor] = []
+
+    def _device_tensors(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = str(device)
+        cached = self._cache.get(key)
+        if cached is None:
+            signed = self._signed_cpu.to(device=device)
+            target_ids = self._target_ids_cpu.to(device=device)
+            other_ids = self._other_ids_cpu.to(device=device)
+            cached = (signed, target_ids, other_ids)
+            self._cache[key] = cached
+        return cached
+
+    @staticmethod
+    def _tilted_kl_from_masses(
+        delta: torch.Tensor,
+        p_target: torch.Tensor,
+        p_other: torch.Tensor,
+        p_neutral: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Exact KL(q||p) for the 3-way target/opposite/neutral exponential tilt."""
+        # Calculations are float32. Clamp the partition masses only against tiny
+        # numerical negatives from ``1 - target - other``.
+        a = delta / float(temperature)
+        ep = torch.exp(a)
+        em = torch.exp(-a)
+        z = p_target * ep + p_other * em + p_neutral
+        z = z.clamp_min(1e-30)
+        q_target = p_target * ep / z
+        q_other = p_other * em / z
+        # log(q_i / p_i) is +a on target, -a on other, -log(z) everywhere.
+        return a * (q_target - q_other) - torch.log(z)
+
+    def _choose_delta(
+        self,
+        p_target: torch.Tensor,
+        p_other: torch.Tensor,
+        p_neutral: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.max_strength == 0 or self.kl_budget == 0:
+            delta = torch.zeros_like(p_target)
+            kl = torch.zeros_like(p_target)
+            return delta, kl
+
+        hi = torch.full_like(p_target, self.max_strength)
+        kl_hi = self._tilted_kl_from_masses(
+            hi, p_target, p_other, p_neutral, self.temperature
+        )
+        cap_ok = kl_hi <= self.kl_budget
+        lo = torch.zeros_like(p_target)
+        upper = hi.clone()
+
+        # Vectorized bisection only matters for rows where max_strength exceeds
+        # the KL budget. Rows already within budget simply remain at the cap.
+        for _ in range(self.bisection_steps):
+            mid = (lo + upper) * 0.5
+            kl_mid = self._tilted_kl_from_masses(
+                mid, p_target, p_other, p_neutral, self.temperature
+            )
+            feasible = kl_mid <= self.kl_budget
+            lo = torch.where(feasible, mid, lo)
+            upper = torch.where(feasible, upper, mid)
+
+        delta = torch.where(cap_ok, hi, lo)
+        kl = self._tilted_kl_from_masses(
+            delta, p_target, p_other, p_neutral, self.temperature
+        )
+        return delta, kl
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        signed, target_ids, other_ids = self._device_tensors(scores.device)
+        vocab = scores.shape[-1]
+        if vocab != self.vocab_size:
+            raise ValueError(
+                f"Processor partition vocab_size={self.vocab_size} but generation scores have vocab={vocab}"
+            )
+
+        # Compute the *unwatermarked* distribution at the same temperature the
+        # sampler will use.  Top-p/top-k are intentionally not included in this
+        # KL: the budget measures only the watermark perturbation, not the base
+        # sampler's truncation policy.
+        with torch.no_grad():
+            p = torch.softmax(scores.float() / self.temperature, dim=-1)
+            p_target = p.index_select(-1, target_ids).sum(dim=-1)
+            p_other = p.index_select(-1, other_ids).sum(dim=-1)
+            p_neutral = (1.0 - p_target - p_other).clamp_min(0.0)
+            delta, kl = self._choose_delta(p_target, p_other, p_neutral)
+            self._delta_steps.append(delta.detach().cpu())
+            self._kl_steps.append(kl.detach().cpu())
+
+        shift = signed.to(dtype=scores.dtype).unsqueeze(0) * delta.to(
+            device=scores.device, dtype=scores.dtype
+        ).unsqueeze(-1)
+        return scores + shift
+
+    def per_example_stats(self, step_counts: Sequence[int] | None = None) -> list[dict[str, float]]:
+        """Return step-aggregated KL/strength diagnostics for each batch row.
+
+        Hugging Face continues calling logits processors for already-finished rows
+        while other rows in the batch are still decoding.  When ``step_counts``
+        is supplied, each row is truncated to its actual generated-token count so
+        those post-EOS calls do not contaminate the diagnostics.
+        """
+        if not self._delta_steps:
+            return []
+        deltas = torch.stack(self._delta_steps, dim=0).float()  # [steps, batch]
+        kls = torch.stack(self._kl_steps, dim=0).float()
+        if step_counts is not None and len(step_counts) != deltas.shape[1]:
+            raise ValueError("step_counts length must match batch size")
+        out: list[dict[str, float]] = []
+        for i in range(deltas.shape[1]):
+            n = deltas.shape[0] if step_counts is None else max(1, min(int(step_counts[i]), deltas.shape[0]))
+            d = deltas[:n, i]
+            k = kls[:n, i]
+            out.append({
+                "mean_applied_strength": float(d.mean().item()),
+                "median_applied_strength": float(d.median().item()),
+                "max_applied_strength": float(d.max().item()),
+                "mean_step_kl": float(k.mean().item()),
+                "max_step_kl": float(k.max().item()),
+                "fraction_steps_at_strength_cap": float(
+                    (d >= self.max_strength - 1e-5).float().mean().item()
+                ) if self.max_strength > 0 else 1.0,
+                "processor_steps": int(d.numel()),
+            })
+        return out

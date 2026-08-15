@@ -94,3 +94,57 @@ def test_symmetric_logits_bias_is_mirrored():
     assert torch.all(o_out[0, pids] == -1.25)
     assert torch.all(o_out[0, oids] == 1.25)
     assert p_out[0, 0] == 0 and o_out[0, 0] == 0
+
+
+def test_adaptive_kl_processor_respects_budget_and_direction():
+    from wmsteg.watermark import AdaptiveKLColorBiasLogitsProcessor, TokenPartition, PURPLE
+
+    part = TokenPartition(
+        purple_ids=np.array([0, 1], dtype=np.int64),
+        orange_ids=np.array([2, 3], dtype=np.int64),
+        neutral_ids=np.array([4], dtype=np.int64),
+        vocab_size=5,
+        metadata={},
+    )
+    scores = torch.tensor([
+        [2.0, 0.5, 1.5, -0.3, 0.2],
+        [0.1, -0.4, 2.3, 1.0, 0.0],
+    ], dtype=torch.float32)
+    temperature = 0.9
+    budget = 0.05
+    proc = AdaptiveKLColorBiasLogitsProcessor(
+        part, PURPLE, kl_budget=budget, max_strength=2.0,
+        temperature=temperature, bisection_steps=20,
+    )
+    shifted = proc(torch.zeros((2, 1), dtype=torch.long), scores.clone())
+    stats = proc.per_example_stats()
+    assert len(stats) == 2
+    assert all(s["max_step_kl"] <= budget + 2e-5 for s in stats)
+
+    p = torch.softmax(scores / temperature, dim=-1)
+    q = torch.softmax(shifted / temperature, dim=-1)
+    kl = (q * (torch.log(q) - torch.log(p))).sum(dim=-1)
+    assert torch.all(kl <= budget + 3e-5)
+    # Purple logits are never shifted downward relative to orange logits.
+    assert torch.all((shifted[:, 0] - scores[:, 0]) >= -1e-6)
+    assert torch.all((shifted[:, 2] - scores[:, 2]) <= 1e-6)
+
+
+def test_adaptive_kl_processor_uses_full_cap_when_budget_allows():
+    from wmsteg.watermark import AdaptiveKLColorBiasLogitsProcessor, TokenPartition, ORANGE
+
+    part = TokenPartition(
+        purple_ids=np.array([0], dtype=np.int64),
+        orange_ids=np.array([1], dtype=np.int64),
+        neutral_ids=np.array([2], dtype=np.int64),
+        vocab_size=3,
+        metadata={},
+    )
+    scores = torch.tensor([[0.0, 0.0, 8.0]], dtype=torch.float32)
+    proc = AdaptiveKLColorBiasLogitsProcessor(
+        part, ORANGE, kl_budget=1.0, max_strength=1.25, temperature=1.0,
+    )
+    shifted = proc(torch.zeros((1, 1), dtype=torch.long), scores.clone())
+    # With almost all mass on a neutral token, the full color shift costs almost no KL.
+    assert abs(float(shifted[0, 1] - scores[0, 1]) - 1.25) < 1e-4
+    assert abs(float(shifted[0, 0] - scores[0, 0]) + 1.25) < 1e-4

@@ -1,114 +1,95 @@
-# Purple / Orange Watermark Recognition — Experiment 0 v2
+# Watermark Steganography Sprint v3
 
-This repository implements a cleaner positive-control experiment for the research question:
+This revision changes **the data-generation methodology**, not just the detector.
 
-> Can post-training make a causal LLM recognize a statistical token watermark, and can that recognition be installed as an internal representation for later experiments?
+The immediate goal is to test whether a causal LLM can learn a statistical purple/orange watermark in realistic-looking **user prompts** while reducing the coherence damage seen with a fixed `±2` logit shift.
 
-The v1 pilot accidentally produced an asymmetric carrier distribution: ordinary text already leaned toward one side of the embedding hyperplane, so boosting the other side mostly made it look neutral. v2 fixes that at the construction level rather than merely increasing the logit bias.
+## What changed
 
-## The key methodological changes
+### 1. Lyra SynthPrompts are the source messages
 
-### 1. Balance by natural-language token mass, not vocabulary size
+By default the generator streams:
 
-A seeded random direction `w` is drawn in the model's input-embedding space. Token `t` has scalar projection
+`lyraaaa/synthprompts_v2_250k`
 
-```text
-s_t = w · e_t
-```
+and uses the dataset's `prompt`, `topic`, `mode`, `style`, `length`, `complexity`, `language`, and `task_spec_level` fields. The default run keeps English prompts between 24 and 320 Qwen tokens. The original Lyra message is always stored alongside both rewrites.
 
-The old code put the threshold at the median over **token types**. That makes equal numbers of vocabulary IDs purple and orange, but says nothing about how frequently those IDs appear in ordinary text.
+The generator **rewrites** each source message; it does not answer it. Every selected source prompt gets a purple and an orange paraphrase.
 
-v2 first generates an unwatermarked calibration corpus using **train topics only**. It counts the re-tokenized carrier text, then chooses the hyperplane threshold that most nearly divides this empirical token mass 50/50:
+### 2. The partition is calibrated on original user prompts
 
-```text
-ordinary colored text ≈ 50% purple / 50% orange
-```
+The v2 partition was calibrated on generated encyclopedia-style carrier text. v3 instead estimates natural token frequency directly from thousands of **unmodified Lyra user prompts**.
 
-This is the baseline the watermark statistic actually needs.
+A random hyperplane is drawn in Qwen's input-embedding space. Its threshold is chosen to split empirical colored-token mass approximately 50/50 on the calibration prompts. Common tokens and an equal-mass band near the hyperplane are neutralized.
 
-### 2. Neutralize common tokens before balancing
+A disjoint set of original Lyra prompts is saved as `control.jsonl`. Their mean purple share should remain close to 0.5.
 
-Special tokens and the `--neutral-top-k` most frequent calibration tokens are neutral. They contribute neither purple nor orange evidence.
+### 3. Per-token KL-constrained watermarking
 
-The frequency-balanced threshold is chosen **after** removing those tokens, so the remaining active token mass is still approximately balanced.
+Fixed-strength watermarking can force the model away from a highly preferred continuation and produce garbage tails, multilingual fragments, emojis, or awkward wording.
 
-### 3. Add a margin around the hyperplane
-
-By default, an additional 10% of empirical active token mass nearest the hyperplane is neutralized, half from each side. This leaves colored tokens farther from the decision boundary while preserving the approximate 50/50 natural baseline.
-
-This makes the token-color feature deliberately easy to represent without making the two watermark conditions semantically different by construction.
-
-### 4. Symmetric watermarking
-
-There is now one parameter, `strength`.
-
-For a purple watermark:
+v3 uses an adaptive perturbation. At each generated token, let `p` be the unwatermarked model distribution at the configured temperature. For target-color sign `c_t ∈ {-1, 0, +1}` it considers:
 
 ```text
-purple logits  += strength
-orange logits  -= strength
-neutral logits unchanged
+q_delta(t) ∝ p(t) * exp((delta / T) * c_t)
 ```
 
-For orange, the signs reverse exactly.
-
-So neither color is privileged by the intervention itself.
-
-### 5. Automatic strength pilot
-
-`--strength auto` tries a short list of strengths using **train-topic prompts only** and selects the weakest one that gives a clear count-statistic separation. This prevents a full 1,000-example generation run from being wasted on an obviously weak watermark.
-
-The default candidates are:
+The processor chooses the **largest** `delta <= max_strength` satisfying:
 
 ```text
-0.50, 0.75, 1.00, 1.25, 1.50, 2.00
+KL(q_delta || p) <= kl_budget
 ```
 
-### 6. Held-out unwatermarked control
-
-After the partition is fixed, the script generates unwatermarked passages from validation/test topics that were not used to balance the partition. These are saved in `control.jsonl`.
-
-A good run should show the held-out control remaining close to 50/50 purple/orange.
-
-### 7. Fixed carrier length
-
-Purple and orange passages are generated with exactly the same requested number of new tokens (160 by default). This removes passage length as an easy class cue and gives each example roughly the same number of watermark observations.
-
-### 8. Coupled purple/orange sampling
-
-Every source prompt appears in both colors. For each split, the RNG state is reset to the same seed before purple generation and orange generation. The paired examples therefore use coupled sampling randomness; the deliberate difference is the signed watermark intervention.
-
-### 9. Hard sanity gate before detector training
-
-The known token partition gives us a handcrafted detector. We use that as the true positive-control check before asking the neural network to learn anything.
-
-By default the generated dataset must satisfy all of:
-
-- held-out unwatermarked purple fraction within 0.08 of 0.50;
-- held-out count-statistic accuracy at least 90%;
-- held-out mean purple-vs-orange fraction gap at least 0.40;
-- at least 20% of detector-input tokens remain colored.
-
-If the dataset fails, generation exits non-zero and `run_exp0.sh` will **not start expensive detector training**.
-
-This is more important than demanding that a linear probe over raw mean embeddings achieve a particular score. A mean embedding does not exactly compute `count(sign(w·e_t - b))`, so it is a useful diagnostic, not the ground-truth watermark detector.
-
-## Default model
+The KL is exact for this three-way target/opposite/neutral exponential tilt. The default is:
 
 ```text
-Qwen/Qwen3-1.7B
+KL_BUDGET=0.10       # nats per generated token
+MAX_STRENGTH=2.0
+TEMPERATURE=0.9
 ```
 
-The code expects a recent Hugging Face Transformers installation and uses the model's normal causal generation path plus a custom `LogitsProcessor`.
+So easy, high-entropy positions can carry a visible watermark, while positions where watermarking would substantially distort the base distribution automatically get a weaker shift.
+
+The KL calculation measures the watermark perturbation relative to the base distribution **after temperature and before top-p/top-k truncation**. Top-p/top-k are held constant across both colors.
+
+### 4. Weak examples are allowed, but training filtering is paired
+
+Some source prompts may simply be difficult to watermark without changing them too much. That is not treated as a generation failure.
+
+All validation and test rewrites are retained. For training only, the default keeps an underlying prompt if **both** members of the pair satisfy:
+
+```text
+purple z >= +1.5
+orange z <= -1.5
+```
+
+Pairwise filtering matters: we never retain only the easy purple rewrite and discard its orange counterpart.
+
+Files:
+
+- `train_all.jsonl`: every generated train rewrite
+- `train.jsonl`: pairwise-filtered train set consumed by detector training
+- `train_rejected_weak.jsonl`: weak rejected train pairs
+- `val.jsonl`, `test.jsonl`: unfiltered held-out rewrites
+
+Set `TRAIN_MIN_ABS_Z=0` to disable filtering.
+
+### 5. 2x the previous source-prompt count
+
+The full datagen script defaults to **1,000 underlying prompts**, versus 500 in v2:
+
+- 800 train source prompts
+- 100 validation
+- 100 test
+- two rewrites per source prompt
+
+The training weak-watermark filter is applied after generation.
 
 ## Install
 
-On the Lambda instance:
+A CUDA PyTorch build is assumed to already exist on the Lambda image.
 
 ```bash
-unzip watermark_sprint_v2.zip
-cd watermark_sprint_v2
-
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
@@ -116,176 +97,178 @@ pip install -e . pytest
 pytest -q
 ```
 
-If your Lambda image already includes CUDA PyTorch, keep that installation. Do not accidentally replace it with a CPU-only wheel.
+The packaged unit tests include an explicit check that the adaptive processor's realized `KL(q||p)` respects the configured budget.
 
-## Run the full Experiment 0 v2
+## Recommended first run: KL quality pilot
+
+Before spending inference on the full 1,000-prompt run, compare a few KL budgets on the same seeded Lyra source sample:
+
+```bash
+./run_lyra_kl_pilot.sh
+```
+
+Defaults:
+
+```text
+0.04  0.08  0.12  0.20 nats/token
+24 underlying prompts per budget
+```
+
+For each budget, read:
+
+```text
+runs/lyra_kl_pilot_eps_*/examples_side_by_side.md
+runs/lyra_kl_pilot_eps_*/data_summary.json
+```
+
+The Markdown file puts original / purple / orange versions next to each other and reports z-score, mean per-token KL, and mean applied logit strength.
+
+A useful pilot decision is not “which budget maximizes z?” It is “where do rewrites still look semantically faithful and natural while enough examples carry a useful watermark?”
+
+You can override the budgets:
+
+```bash
+BUDGETS="0.05 0.08 0.10 0.15" ./run_lyra_kl_pilot.sh
+```
+
+## Full 2x datagen
+
+Once you choose a budget:
+
+```bash
+KL_BUDGET=0.10 ./run_lyra_kl_datagen.sh
+```
+
+or simply:
 
 ```bash
 ./run_exp0.sh
 ```
 
-The default run performs:
-
-1. unwatermarked frequency calibration;
-2. frequency-balanced hyperplane construction;
-3. held-out unwatermarked control generation;
-4. automatic symmetric watermark-strength pilot;
-5. paired purple/orange dataset generation;
-6. dataset sanity gate;
-7. frozen suffix-position linear-head control;
-8. joint backbone + linear-head watermark-recognition training.
-
-For a smaller smoke test:
+Useful overrides:
 
 ```bash
-PAIRS=150 CALIBRATION_SAMPLES=64 CONTROL_SAMPLES=32 ./run_exp0.sh
+PAIRS=1000 \
+KL_BUDGET=0.10 \
+MAX_STRENGTH=2.0 \
+TRAIN_MIN_ABS_Z=1.5 \
+BATCH_SIZE=4 \
+./run_lyra_kl_datagen.sh
 ```
 
-For the main sprint run:
+The first file to inspect is:
+
+```text
+runs/exp0_lyra_kl_data/examples_side_by_side.md
+```
+
+Then inspect:
 
 ```bash
-PAIRS=500 ./run_exp0.sh
+python scripts/inspect_lyra_kl.py --data runs/exp0_lyra_kl_data
 ```
 
-You can force a fixed strength instead of using the pilot:
+## Source selection
+
+Defaults:
+
+```text
+dataset: lyraaaa/synthprompts_v2_250k
+language: english
+source length: 24-320 Qwen tokens
+calibration prompts: 4096
+held-out original controls: 512
+```
+
+The Hugging Face dataset is streamed and approximately shuffled, so the whole 250k-row dataset does not need to be materialized.
+
+For a completely reproducible/offline rerun, supply a local Lyra-schema JSONL:
 
 ```bash
-STRENGTH=1.0 ./run_exp0.sh
+python scripts/generate_lyra_kl.py \
+  --source-jsonl my_lyra_sample.jsonl \
+  --output runs/my_run \
+  --pairs 1000
 ```
 
-## Expected data shape
+## Optional detector training
 
-The first thing to inspect is:
+Only do this after manually inspecting rewrite quality.
 
-```text
-runs/exp0_v2_data/data_summary.json
+```bash
+./run_exp0_lyra_kl_train.sh
 ```
 
-The console also prints a compact table via `scripts/inspect_data.py`.
+This uses the filtered `train.jsonl` but unfiltered validation and test sets. The joint run is capped at three epochs because the v2 experiment had essentially learned the watermark-recognition task by epoch 2-3.
 
-A healthy positive-control dataset should look qualitatively like:
+The detector readout remains:
 
 ```text
-held-out unwatermarked: purple fraction ~0.50
-purple watermark:       purple fraction clearly >0.50
-orange watermark:       purple fraction clearly <0.50
-count detector:          very high held-out accuracy
+[watermarked user prompt]\n\nWatermark:
+                           ^ final suffix state -> linear head
 ```
 
-Do not worry about hitting exact example fractions such as 0.80/0.20. The important checks are symmetry, held-out baseline balance, and strong separability.
+## Important limitations
 
-## Data files
+**KL is not semantic equivalence.** A low per-token KL budget should reduce distributional distortion, but it does not prove that a paraphrase preserves every fact or constraint. `examples_side_by_side.md` is deliberately generated to make human inspection easy. A semantic-preservation judge can be added later if needed.
+
+**The current rewriter is the same Qwen checkpoint used to define the token partition.** This keeps token IDs and color definitions exact. A larger Qwen-family rewriter may be possible if tokenizer IDs are verified identical, but v3 does not silently assume cross-model tokenizer compatibility.
+
+**Weak held-out watermarks are intentional.** Do not filter validation/test to make recognition numbers prettier. We eventually want behavior as a function of watermark strength.
+
+**This revision does not resolve base-vs-instruct.** The user's concern is valid: an instruct checkpoint already contains learned refusal/safety behavior, while a base checkpoint creates additional instruction-learning confounds. That should be treated as an experimental axis after the watermark datagen is under control rather than silently choosing one interpretation.
+
+## Main outputs
 
 ```text
-runs/exp0_v2_data/
+runs/exp0_lyra_kl_data/
   partition.npz
   partition_meta.json
-  generation_config.json
-  data_summary.json
+  sources.jsonl
   calibration.jsonl
   control.jsonl
+  train_all.jsonl
   train.jsonl
+  train_rejected_weak.jsonl
   val.jsonl
   test.jsonl
+  data_summary.json
+  generation_config.json
+  examples_side_by_side.md
 ```
 
-`partition.npz` also stores the actual random embedding direction for later mechanistic analysis.
+## Attribution
 
-## Detector setup
+Source user prompts: Lyra, `lyraaaa/synthprompts_v2_250k`, MIT licensed. See the dataset card for full dataset methodology and citation details.
 
-The primary detector presents the carrier as:
+## Adaptive-KL max-strength sweep
 
-```text
-[watermarked carrier passage]
-
-Watermark:
-```
-
-A single `Linear(hidden_size, 2)` classifier reads the final non-padding hidden state. The suffix is identical in both classes and contains no answer label.
-
-### Frozen control
+After the initial KL pilot, use this sweep to determine whether the arbitrary
+`max_strength` ceiling is binding before the KL budget. It holds the KL budget
+fixed and tries progressively larger maximum logit shifts on the same seeded
+Lyra source-prompt sample.
 
 ```bash
-python scripts/train_detector.py \
-  --data runs/exp0_v2_data \
-  --output runs/exp0_v2_suffix_frozen \
-  --mode frozen \
-  --readout suffix \
-  --epochs 10 \
-  --batch-size 16
+KL_BUDGET=0.04 \
+MAX_STRENGTHS="2 4 6 8 12" \
+PAIRS=32 \
+./run_lyra_strength_sweep.sh
 ```
 
-This asks whether the existing model already makes watermark identity linearly readable at the designated aggregation position.
+For a slightly less noisy pilot, use `PAIRS=64`. The script intentionally sets
+`--train-min-abs-z 0`: this is a generator-characterization sweep, so weak
+examples must remain visible rather than being filtered away.
 
-### Joint representation training
+Outputs are written under `runs/lyra_strength_sweep/`. After all runs finish,
+`scripts/summarize_strength_sweep.py` creates:
 
-```bash
-python scripts/train_detector.py \
-  --data runs/exp0_v2_data \
-  --output runs/exp0_v2_suffix_joint \
-  --mode joint \
-  --readout suffix \
-  --epochs 8 \
-  --batch-size 4 \
-  --grad-accum 4 \
-  --lr-backbone 5e-5 \
-  --lr-head 1e-3
-```
+- `summary/strength_sweep.md`
+- `summary/strength_sweep.csv`
+- four matplotlib charts covering watermark z, cap saturation, actual KL usage,
+  and token-color separation
+- per-setting `examples_side_by_side.md` files for qualitative inspection
 
-The modified ordinary causal-LM checkpoint is saved at:
-
-```text
-runs/exp0_v2_suffix_joint/backbone_final/
-```
-
-The auxiliary classifier is saved separately as:
-
-```text
-runs/exp0_v2_suffix_joint/head.pt
-```
-
-For the later semantic-vs-watermark generalization experiment, initialize from `backbone_final/` and discard `head.pt`.
-
-## Optional layer diagnostics
-
-Layer-by-layer mean-pooled linear probes are still included, but they are now explicitly diagnostic rather than a required success criterion:
-
-```bash
-RUN_LAYER_PROBES=1 ./run_exp0.sh
-```
-
-or, after generation:
-
-```bash
-python scripts/probe_layers.py \
-  --data runs/exp0_v2_data \
-  --layers embeddings,1,7,14,21,final
-```
-
-## Useful environment variables
-
-```text
-MODEL=Qwen/Qwen3-1.7B
-DATA=runs/exp0_v2_data
-PAIRS=500
-CALIBRATION_SAMPLES=128
-CONTROL_SAMPLES=64
-STRENGTH=auto
-NEUTRAL_TOP_K=256
-NEUTRAL_MARGIN_MASS=0.10
-CARRIER_TOKENS=160
-RUN_LAYER_PROBES=0
-```
-
-## What to send back after the run
-
-The most useful files are:
-
-```text
-runs/exp0_v2_data/data_summary.json
-runs/exp0_v2_data/partition_meta.json
-runs/exp0_v2_suffix_frozen/metrics.json
-runs/exp0_v2_suffix_joint/metrics.json
-```
-
-If the generation sanity gate fails, send `data_summary.json` before changing detector hyperparameters. The methodology is intentionally set up so that carrier-data problems are diagnosed before model-training problems.
+A useful operating point has strong purple/orange separation while maintaining
+natural paraphrases, and has a substantially lower fraction of generation steps
+at the strength cap. The actual mean KL should remain below the configured
+budget by construction.
