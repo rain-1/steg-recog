@@ -1,3 +1,23 @@
+# Watermark sampler v5.2 — length-aware validation
+
+This package keeps the v5.1 sampler unchanged and adds a length-aware strength sweep. The purpose is to test whether weak watermark cases are mainly short prompts / short colored-token sequences before adding any new gating mechanism.
+
+Quick run:
+
+```bash
+./run_length_strength_sweep.sh
+```
+
+It sweeps strengths `3.0,3.5,4.0,4.5,5.0` on the same 128 held-out Lyra prompts, with no entropy gate or top-k gate. It then reports paired watermark success by source-token length and by the minimum number of colored tokens in each purple/orange rewrite.
+
+If you already have a stronger-strength v5.1 run in progress, do **not** rerun inference just to get the length analysis. Let it finish and run:
+
+```bash
+./analyze_existing_run.sh runs/YOUR_EXISTING_RUN
+```
+
+---
+
 # Watermark sampler v5.1 — broad lexical eligibility
 
 This package validates an **external fixed-bias purple/orange watermark sampler** on Lyra SynthPrompts rewrites. It does not train a watermarker or detector.

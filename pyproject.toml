@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wmsteg-sampler-validation"
-version = "0.5.1"
+version = "0.5.2"
 description = "Fixed-bias purple/orange watermark validation with broad lexical eligibility"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,3 +19,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["wmsteg*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

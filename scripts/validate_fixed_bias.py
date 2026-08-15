@@ -306,7 +306,7 @@ def main() -> None:
     calibration_summary = summarize_rows(calibration_scored)
     records = []
     full_summary = {
-        "methodology_version": "5.1",
+        "methodology_version": "5.2",
         "sampler": {
             "type": "full_softmax_fixed_color_bias",
             "temperature": args.temperature,
