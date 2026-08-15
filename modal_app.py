@@ -25,6 +25,8 @@ CACHE_MOUNT = "/cache"
 ARTIFACT_MOUNT = "/artifacts"
 HF_CACHE = modal.Volume.from_name("wmsteg-hf-cache", create_if_missing=True)
 ARTIFACTS = modal.Volume.from_name("wmsteg-artifacts", create_if_missing=True)
+DETECTOR_MOUNT = "/detector-runs"
+DETECTOR_RUNS = modal.Volume.from_name("wmsteg-detector-runs", create_if_missing=True)
 
 REMOTE_PACKAGES = [
     "torch>=2.7,<3",
@@ -618,6 +620,62 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _completed_source_replicates(raw_dir: Path) -> set[tuple[str, int]]:
+    """Return source/replicate pairs that have all control+purple+orange rows saved."""
+    seen: dict[tuple[str, int], set[str]] = {}
+    for path in sorted(raw_dir.glob("batch_*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for row in payload.get("rows", []):
+            key = (str(row["source_id"]), int(row.get("replicate", 0)))
+            seen.setdefault(key, set()).add(str(row.get("watermark", "control")))
+    required = {"control", "purple", "orange"}
+    return {key for key, conditions in seen.items() if required.issubset(conditions)}
+
+
+def _make_extension_tasks(
+    sources: list[dict],
+    *,
+    replicate: int,
+    batch_size: int,
+    cfg: dict,
+    first_batch_id: int,
+) -> list[dict]:
+    """Make a stable task plan for extending an existing run with another seed."""
+    tasks: list[dict] = []
+    batch_id = first_batch_id
+    for split_idx, split in enumerate(("train", "val", "test")):
+        split_sources = sorted(
+            [x for x in sources if x["default_split"] == split],
+            key=lambda x: int(x["global_pair_id"]),
+        )
+        for start in range(0, len(split_sources), batch_size):
+            batch = split_sources[start:start + batch_size]
+            # This seed plan is saved before generation, so retries are exactly reproducible.
+            seed = int(cfg["main_data_seed"]) + replicate * 1_000_000 + 2_050_000 + split_idx * 100_000 + start
+            tasks.append({
+                "batch_id": batch_id,
+                "replicate": replicate,
+                "sources": batch,
+                "seed": seed,
+                "temperature": cfg["temperature"],
+                "strength": cfg["strength"],
+                "rewrite_max_ratio": cfg["rewrite_max_ratio"],
+                "rewrite_extra_tokens": cfg["rewrite_extra_tokens"],
+                "max_new_tokens_cap": cfg["max_new_tokens_cap"],
+            })
+            batch_id += 1
+    return tasks
+
+
 def _collect_plain(worker: Any, tasks: list[dict]) -> list[dict]:
     by_batch: dict[int, dict] = {}
     errors: list[str] = []
@@ -646,6 +704,34 @@ def _save_partition_local(outdir: Path, payload: dict) -> None:
     (outdir / "partition_spec.json").write_text(
         json.dumps(payload["partition_spec"], indent=2, sort_keys=True), encoding="utf-8"
     )
+
+
+@app.function(
+    image=image,
+    gpu="A100-40GB",
+    cpu=8,
+    memory=32768,
+    timeout=60 * 60 * 4,
+    volumes={
+        CACHE_MOUNT: HF_CACHE.with_mount_options(read_only=True),
+        DETECTOR_MOUNT: DETECTOR_RUNS,
+    },
+)
+def train_detector_remote(payload_gz: bytes, config: dict) -> dict:
+    """Train frozen-readout and jointly-trained watermark detector PoCs on one GPU."""
+    import gzip
+    from wmsteg.detector_poc import run_detector_training
+
+    payload = json.loads(gzip.decompress(payload_gz).decode("utf-8"))
+    result = run_detector_training(
+        payload,
+        config=config,
+        model_id=MODEL_ID,
+        cache_dir=f"{CACHE_MOUNT}/huggingface/hub",
+        remote_root=Path(DETECTOR_MOUNT),
+    )
+    DETECTOR_RUNS.commit()
+    return result
 
 
 def _run(
@@ -741,7 +827,7 @@ def _run(
     actual_partition_spec_hash = str(partition_payload["partition_spec"].get("spec_hash", expected_spec_hash))
 
     config = {
-        "dataset_format_version": "modal-watermark-bank-v2",
+        "dataset_format_version": "modal-watermark-bank-v2.1",
         "run_stage": run_stage,
         "frozen": False,
         "model": MODEL_ID,
@@ -865,7 +951,7 @@ def main(
     workers: int = 4,
     gpu: str = "A10",
     source_candidates: int = 128,
-    robustness_sources: int = 16,
+    robustness_sources: int = 128,
     batch_size: int = 4,
     strength: float = 5.0,
     min_source_tokens: int = 96,
@@ -929,7 +1015,7 @@ def poc(
         workers=workers,
         gpu=gpu,
         source_candidates=128,
-        robustness_sources=16,
+        robustness_sources=128,
         batch_size=4,
         strength=5.0,
         min_source_tokens=96,
@@ -937,7 +1023,7 @@ def poc(
         main_data_seed=6060,
         source_pool_multiplier=3,
         rebuild_partition=False,
-        run_stage="poc-128",
+        run_stage="poc-128-two-seed",
     )
 
 
@@ -963,3 +1049,207 @@ def pilot(
         rebuild_partition=False,
         run_stage="pilot-512",
     )
+
+
+@app.local_entrypoint()
+def complete_second_seed(
+    output: str = "runs/lyra_watermark_poc_128",
+    workers: int = 4,
+    gpu: str = "A10",
+    batch_size: int = 4,
+) -> None:
+    """Extend an existing v2 PoC in place so every canonical source has replicate 1.
+
+    This is specifically safe for the already-generated 128-source run: existing
+    replicate-1 batches are preserved, only missing sources are generated, and a
+    stable extension plan is written before any new GPU work starts.
+    """
+    if workers < 1 or batch_size < 1:
+        raise ValueError("workers and batch_size must be >= 1")
+    outdir = Path(output)
+    raw_dir = outdir / "raw_batches"
+    config_path = outdir / "generation_config.json"
+    sources_path = outdir / "sources.jsonl"
+    if not config_path.exists() or not sources_path.exists() or not raw_dir.exists():
+        raise FileNotFoundError(
+            f"{outdir} does not look like an existing bank run; expected generation_config.json, sources.jsonl, raw_batches/"
+        )
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    sources = _read_jsonl(sources_path)
+    if len(sources) != int(config.get("source_candidates", len(sources))):
+        raise RuntimeError("sources.jsonl disagrees with generation_config.json")
+    if str(config.get("partition_tag")) != PARTITION_TAG:
+        raise RuntimeError(f"Expected partition {PARTITION_TAG}, found {config.get('partition_tag')}")
+
+    # Refresh/verify the persistent HF cache before launching GPU workers.
+    warm_hf_cache.remote(str(config["model_revision"]), str(config.get("dataset_revision", "")))
+
+    completed = _completed_source_replicates(raw_dir)
+    missing = [src for src in sources if (str(src["source_id"]), 1) not in completed]
+    print(f"replicate 1 already complete: {len(sources) - len(missing)}/{len(sources)} sources", flush=True)
+    print(f"replicate 1 still needed:    {len(missing)}/{len(sources)} sources", flush=True)
+
+    plan_path = outdir / "replicate_1_extension_plan.json"
+    if plan_path.exists():
+        tasks = json.loads(plan_path.read_text(encoding="utf-8"))["tasks"]
+        planned_ids = {str(src["source_id"]) for task in tasks for src in task["sources"]}
+        missing_ids = {str(src["source_id"]) for src in missing}
+        if not missing_ids.issubset(planned_ids):
+            raise RuntimeError("Existing replicate-1 extension plan does not cover all currently missing sources")
+        print(f"Reusing saved extension plan with {len(tasks)} batches.", flush=True)
+    else:
+        max_existing_batch = max(
+            [int(p.stem.split("_")[-1]) for p in raw_dir.glob("batch_*.json") if p.stem.split("_")[-1].isdigit()],
+            default=-1,
+        )
+        tasks = _make_extension_tasks(
+            missing,
+            replicate=1,
+            batch_size=batch_size,
+            cfg=config,
+            first_batch_id=max_existing_batch + 1,
+        )
+        plan_payload = {
+            "format": "replicate-extension-v1",
+            "replicate": 1,
+            "created_from_source_count": len(sources),
+            "already_complete_at_plan_time": len(sources) - len(missing),
+            "tasks": tasks,
+        }
+        plan_path.write_text(json.dumps(plan_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Saved stable extension plan: {plan_path} ({len(tasks)} batches)", flush=True)
+
+    existing_batch_ids = {
+        int(p.stem.split("_")[-1])
+        for p in raw_dir.glob("batch_*.json")
+        if p.stem.split("_")[-1].isdigit()
+    }
+    pending = [t for t in tasks if int(t["batch_id"]) not in existing_batch_ids]
+    if pending:
+        WorkerVariant = _with_options(WatermarkWorker, gpu=gpu, max_containers=workers, scaledown_window=300)
+        worker = WorkerVariant(model_revision=str(config["model_revision"]), partition_tag=PARTITION_TAG)
+        errors: list[str] = []
+        done = 0
+        for result in worker.generate_batch.map(pending, order_outputs=False, return_exceptions=True):
+            if isinstance(result, Exception):
+                errors.append(repr(result))
+                continue
+            bid = int(result["batch_id"])
+            tmp = raw_dir / f"batch_{bid:05d}.json.tmp"
+            final = raw_dir / f"batch_{bid:05d}.json"
+            tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, final)
+            done += 1
+            print(f"second-seed batches completed: {done}/{len(pending)}", flush=True)
+        if errors:
+            print("Successful extension batches were saved. Rerun the same command to resume.", flush=True)
+            for err in errors[:20]:
+                print("  " + err, flush=True)
+            raise RuntimeError(f"{len(errors)} extension batches failed")
+    else:
+        print("No second-seed GPU work remains; reassembling reports only.", flush=True)
+
+    completed_after = _completed_source_replicates(raw_dir)
+    missing_after = [src for src in sources if (str(src["source_id"]), 1) not in completed_after]
+    if missing_after:
+        raise RuntimeError(f"replicate 1 is still missing for {len(missing_after)} sources")
+
+    config["dataset_format_version"] = "modal-watermark-bank-v2.1"
+    config["robustness_sources"] = len(sources)
+    config["run_stage"] = "poc-128-two-seed" if len(sources) == 128 else str(config.get("run_stage", "poc")) + "-two-seed"
+    config["expected_batches"] = len(list(raw_dir.glob("batch_*.json")))
+    history = list(config.get("extension_history", []))
+    history.append({
+        "kind": "complete_second_seed",
+        "replicate": 1,
+        "source_count": len(sources),
+        "plan_file": plan_path.name,
+    })
+    config["extension_history"] = history
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+
+    from wmsteg.bank_dataset import assemble_bank
+    print("Reassembling bank with orthogonal acceptance flags and two-seed analysis...", flush=True)
+    summary = assemble_bank(outdir, config)
+    print((outdir / "bank_summary.md").read_text(encoding="utf-8"), flush=True)
+    print((outdir / "robustness_analysis.md").read_text(encoding="utf-8"), flush=True)
+    print(f"Done. Extended bank: {outdir.resolve()}", flush=True)
+
+
+@app.local_entrypoint()
+def reassemble_bank(output: str = "runs/lyra_watermark_poc_128") -> None:
+    """Recompute v2.1 flags/reports from existing raw batches with zero inference."""
+    outdir = Path(output)
+    config_path = outdir / "generation_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["dataset_format_version"] = "modal-watermark-bank-v2.1"
+    config["expected_batches"] = len(list((outdir / "raw_batches").glob("batch_*.json")))
+    from wmsteg.bank_dataset import assemble_bank
+    summary = assemble_bank(outdir, config)
+    print((outdir / "bank_summary.md").read_text(encoding="utf-8"), flush=True)
+    if (outdir / "robustness_analysis.md").exists():
+        print((outdir / "robustness_analysis.md").read_text(encoding="utf-8"), flush=True)
+
+
+@app.local_entrypoint()
+def detector_poc(
+    bank: str = "runs/lyra_watermark_poc_128",
+    output: str = "runs/detector_poc_128",
+    gpu: str = "A100-40GB",
+    save_checkpoint: bool = True,
+) -> None:
+    """Run the source-disjoint frozen-vs-joint watermark-recognition PoC."""
+    import gzip
+    from wmsteg.detector_poc import prepare_detector_payload
+
+    bank_dir = Path(bank)
+    records_path = bank_dir / "pair_records_all.jsonl"
+    config_path = bank_dir / "generation_config.json"
+    if not records_path.exists() or not config_path.exists():
+        raise FileNotFoundError("Run complete_second_seed/reassemble_bank first; pair_records_all.jsonl and generation_config.json are required")
+    records = _read_jsonl(records_path)
+    bank_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    payload = prepare_detector_payload(records)
+    print(json.dumps(payload["counts"], indent=2), flush=True)
+    if payload["counts"]["train_strong"] < 40:
+        raise RuntimeError("Too few detector-eligible training texts for a meaningful PoC")
+
+    # Ensure the immutable model revision is still available in the shared cache.
+    warm_hf_cache.remote(str(bank_cfg["model_revision"]), str(bank_cfg.get("dataset_revision", "")))
+    run_name = Path(output).name
+    train_cfg = {
+        "run_name": run_name,
+        "model_revision": str(bank_cfg["model_revision"]),
+        "suffix": "\n\nWatermark:",
+        "max_length": 512,
+        "seed": 123,
+        "frozen_epochs": 10,
+        "joint_epochs": 3,
+        "frozen_batch_size": 32,
+        "joint_batch_size": 2,
+        "grad_accum": 4,
+        "lr_head": 1e-3,
+        "lr_backbone": 5e-5,
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0,
+        "save_checkpoint": bool(save_checkpoint),
+        "bank_partition_sha256": str(bank_cfg.get("partition_sha256", "")),
+        "bank_partition_tag": str(bank_cfg.get("partition_tag", "")),
+    }
+    payload_gz = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"), compresslevel=6)
+    Remote = train_detector_remote.with_options(gpu=gpu)
+    result = Remote.remote(payload_gz, train_cfg)
+
+    outdir = Path(output)
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    from wmsteg.detector_poc import render_detector_summary
+    summary_md = render_detector_summary(result)
+    (outdir / "summary.md").write_text(summary_md, encoding="utf-8")
+    print(summary_md, flush=True)
+    if result.get("remote_run_path"):
+        print("Checkpoint/remote artifacts live in Modal Volume `wmsteg-detector-runs`.", flush=True)
+        print(f"To download: modal volume get wmsteg-detector-runs {result['remote_run_path']} {outdir}/remote", flush=True)

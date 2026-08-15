@@ -98,3 +98,31 @@ def test_assemble_bank_preserves_replicates_and_folds(tmp_path):
     assert (tmp_path / "fold_assignments.jsonl").exists()
     assert (tmp_path / "folds" / "fold_0_strong.jsonl").exists()
     assert json.loads((tmp_path / "manifest.json").read_text())["frozen"] is False
+
+
+def test_decisions_separate_watermark_health_and_literal_fidelity(tmp_path):
+    from wmsteg.bank_dataset import build_bank_decisions
+
+    rows = [
+        full_row("s0", 0, 0, None, "control", 0.0, 0.5),
+        full_row("s0", 0, 0, 0, "purple", 2.5, 0.65),
+        full_row("s0", 0, 0, 1, "orange", -2.5, 0.35),
+    ]
+    # Make the purple rewrite semantically plausible but change an exact literal.
+    rows[1]["text"] = "Keep 2022 and `Sales` exactly."
+    cfg = {
+        "z_threshold": 1.5,
+        "min_char_length_ratio": 0.5,
+        "max_char_length_ratio": 1.8,
+        "max_repeated_trigram_fraction": 0.1,
+        "max_adjacent_repeat_fraction": 0.1,
+        "require_number_preservation": True,
+        "require_backtick_preservation": True,
+    }
+    d = build_bank_decisions(rows, cfg)[0]
+    assert d["watermark_pass"] is True
+    assert d["generation_health_pass"] is True
+    assert d["literal_fidelity_pass"] is False
+    assert d["detector_training_pass"] is True
+    assert d["strict_pair_pass"] is False
+    assert "purple:numeric_literal_changed" in d["literal_fidelity_reasons"]

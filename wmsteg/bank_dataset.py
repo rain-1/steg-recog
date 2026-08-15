@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .final_dataset import (
+    backtick_literals,
     canonical_json_hash,
     informational_quality_flags,
+    numeric_literals,
     quality_reasons,
     sha256_file,
     summarize_rows,
@@ -47,6 +49,12 @@ def _decision_key(row: dict) -> tuple[str, int]:
 
 
 def build_bank_decisions(rows: Sequence[dict], config: dict) -> list[dict]:
+    """Build orthogonal acceptance flags for every source/replicate pair.
+
+    We deliberately keep watermark strength, basic generation health, and literal
+    fidelity separate.  `strong_and_clean` remains as a backwards-compatible
+    alias for the strict conjunction of all three.
+    """
     grouped: dict[tuple[str, int], dict[str, dict]] = defaultdict(dict)
     for row in rows:
         grouped[_decision_key(row)][str(row.get("watermark", "control"))] = row
@@ -58,38 +66,67 @@ def build_bank_decisions(rows: Sequence[dict], config: dict) -> list[dict]:
         o = cond.get("orange")
         c = cond.get("control")
         base = p or o or c or {}
-        reasons: list[str] = []
-        review_flags: dict[str, list[str]] = {}
-        if c is None:
-            reasons.append("missing_control")
-        if p is None:
-            reasons.append("missing_purple")
-        if o is None:
-            reasons.append("missing_orange")
 
+        infrastructure_reasons: list[str] = []
+        if c is None:
+            infrastructure_reasons.append("missing_control")
+        if p is None:
+            infrastructure_reasons.append("missing_purple")
+        if o is None:
+            infrastructure_reasons.append("missing_orange")
+
+        watermark_reasons: list[str] = []
+        generation_health_reasons: list[str] = []
+        literal_fidelity_reasons: list[str] = []
+        review_flags: dict[str, list[str]] = {}
         pz = None
         oz = None
+
         if p is not None and o is not None:
             for name, row in (("purple", p), ("orange", o)):
-                row_reasons = quality_reasons(
+                # Health checks intentionally exclude exact-number/backtick fidelity.
+                health = quality_reasons(
                     row["source_prompt"],
                     row,
                     min_char_length_ratio=float(config["min_char_length_ratio"]),
                     max_char_length_ratio=float(config["max_char_length_ratio"]),
                     max_repeated_trigram_fraction=float(config["max_repeated_trigram_fraction"]),
                     max_adjacent_repeat_fraction=float(config["max_adjacent_repeat_fraction"]),
-                    require_number_preservation=bool(config["require_number_preservation"]),
-                    require_backtick_preservation=bool(config["require_backtick_preservation"]),
+                    require_number_preservation=False,
+                    require_backtick_preservation=False,
                 )
-                reasons.extend(f"{name}:{x}" for x in row_reasons)
-                review_flags[name] = informational_quality_flags(row["source_prompt"], row)
+                generation_health_reasons.extend(f"{name}:{x}" for x in health)
+
+                source = str(row["source_prompt"])
+                text = str(row.get("text", ""))
+                if bool(config.get("require_number_preservation", True)) and numeric_literals(source) != numeric_literals(text):
+                    literal_fidelity_reasons.append(f"{name}:numeric_literal_changed")
+                if bool(config.get("require_backtick_preservation", True)) and backtick_literals(source) != backtick_literals(text):
+                    literal_fidelity_reasons.append(f"{name}:backtick_literal_changed")
+                review_flags[name] = informational_quality_flags(source, row)
+
             pz = float(p["z_score_purple_minus_orange"])
             oz = float(o["z_score_purple_minus_orange"])
             if pz < zt:
-                reasons.append("purple:weak_z")
+                watermark_reasons.append("purple:weak_z")
             if oz > -zt:
-                reasons.append("orange:weak_z")
+                watermark_reasons.append("orange:weak_z")
 
+        watermark_pass = bool(p is not None and o is not None and not watermark_reasons)
+        generation_health_pass = bool(p is not None and o is not None and not generation_health_reasons)
+        literal_fidelity_pass = bool(p is not None and o is not None and not literal_fidelity_reasons)
+        complete_triplet = not infrastructure_reasons
+        strict_pair_pass = bool(
+            complete_triplet and watermark_pass and generation_health_pass and literal_fidelity_pass
+        )
+        detector_training_pass = bool(complete_triplet and watermark_pass and generation_health_pass)
+
+        hard_reject_reasons = (
+            infrastructure_reasons
+            + watermark_reasons
+            + generation_health_reasons
+            + literal_fidelity_reasons
+        )
         decisions.append({
             "source_id": source_id,
             "replicate": replicate,
@@ -100,9 +137,19 @@ def build_bank_decisions(rows: Sequence[dict], config: dict) -> list[dict]:
             "source_token_length": int(base.get("source_token_length", 0)),
             "purple_z": pz,
             "orange_z": oz,
-            "hard_reject_reasons": reasons,
+            "complete_triplet": complete_triplet,
+            "watermark_pass": watermark_pass,
+            "generation_health_pass": generation_health_pass,
+            "literal_fidelity_pass": literal_fidelity_pass,
+            "detector_training_pass": detector_training_pass,
+            "strict_pair_pass": strict_pair_pass,
+            "strong_and_clean": strict_pair_pass,
+            "infrastructure_reasons": infrastructure_reasons,
+            "watermark_reasons": watermark_reasons,
+            "generation_health_reasons": generation_health_reasons,
+            "literal_fidelity_reasons": literal_fidelity_reasons,
+            "hard_reject_reasons": hard_reject_reasons,
             "review_flags": review_flags,
-            "strong_and_clean": not reasons,
         })
     return sorted(decisions, key=lambda x: (x["global_pair_id"], x["replicate"]))
 
@@ -188,34 +235,107 @@ def _symmetry_error(summary: dict) -> float:
     return abs(pz - oz) / max(1e-12, (pz + oz) / 2.0)
 
 
-def _robustness_summary(decisions: Sequence[dict]) -> dict:
+def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return float("nan")
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0.0 or vy <= 0.0:
+        return float("nan")
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / math.sqrt(vx * vy)
+
+
+def _flag_rate(ds: Sequence[dict], flag: str) -> float:
+    return sum(bool(d.get(flag, False)) for d in ds) / len(ds) if ds else float("nan")
+
+
+def _robustness_details(decisions: Sequence[dict]) -> tuple[dict, list[dict]]:
     by_source: dict[str, dict[int, dict]] = defaultdict(dict)
     for d in decisions:
         by_source[str(d["source_id"])][int(d["replicate"])] = d
     paired = [(src, reps[0], reps[1]) for src, reps in by_source.items() if 0 in reps and 1 in reps]
     if not paired:
-        return {"n_sources": 0}
-    both_strong = sum(int(a["strong_and_clean"] and b["strong_and_clean"]) for _, a, b in paired)
-    purple_same_sign = 0
-    orange_same_sign = 0
-    p_abs_delta = []
-    o_abs_delta = []
-    for _, a, b in paired:
+        return {"n_sources": 0}, []
+
+    a0 = [a for _, a, _ in paired]
+    a1 = [b for _, _, b in paired]
+    detail_rows: list[dict] = []
+    p0: list[float] = []
+    p1: list[float] = []
+    o0: list[float] = []
+    o1: list[float] = []
+    purple_direction = 0
+    orange_direction = 0
+
+    for src, a, b in paired:
         if a["purple_z"] is not None and b["purple_z"] is not None:
-            purple_same_sign += int(float(a["purple_z"]) > 0 and float(b["purple_z"]) > 0)
-            p_abs_delta.append(abs(float(a["purple_z"]) - float(b["purple_z"])))
+            p0.append(float(a["purple_z"]))
+            p1.append(float(b["purple_z"]))
+            purple_direction += int(float(a["purple_z"]) > 0 and float(b["purple_z"]) > 0)
         if a["orange_z"] is not None and b["orange_z"] is not None:
-            orange_same_sign += int(float(a["orange_z"]) < 0 and float(b["orange_z"]) < 0)
-            o_abs_delta.append(abs(float(a["orange_z"]) - float(b["orange_z"])))
+            o0.append(float(a["orange_z"]))
+            o1.append(float(b["orange_z"]))
+            orange_direction += int(float(a["orange_z"]) < 0 and float(b["orange_z"]) < 0)
+
+        s0 = bool(a["strict_pair_pass"])
+        s1 = bool(b["strict_pair_pass"])
+        w0 = bool(a["watermark_pass"])
+        w1 = bool(b["watermark_pass"])
+        detail_rows.append({
+            "source_id": src,
+            "global_pair_id": int(a.get("global_pair_id", -1)),
+            "fold": int(a.get("fold", -1)),
+            "default_split": a.get("default_split"),
+            "replicate0": a,
+            "replicate1": b,
+            "strict_outcome": "both" if s0 and s1 else ("r0_only" if s0 else ("r1_only" if s1 else "neither")),
+            "watermark_outcome": "both" if w0 and w1 else ("r0_only" if w0 else ("r1_only" if w1 else "neither")),
+            "rescued_strict_by_retry": (not s0) and s1,
+            "rescued_watermark_by_retry": (not w0) and w1,
+        })
+
     n = len(paired)
-    return {
+    def combo(flag: str) -> dict:
+        both = sum(bool(a[flag]) and bool(b[flag]) for _, a, b in paired)
+        r0_only = sum(bool(a[flag]) and not bool(b[flag]) for _, a, b in paired)
+        r1_only = sum(not bool(a[flag]) and bool(b[flag]) for _, a, b in paired)
+        neither = n - both - r0_only - r1_only
+        fail0 = r1_only + neither
+        return {
+            "both": both,
+            "replicate0_only": r0_only,
+            "replicate1_only": r1_only,
+            "neither": neither,
+            "at_least_one_rate": (both + r0_only + r1_only) / n,
+            "replicate0_rate": (both + r0_only) / n,
+            "replicate1_rate": (both + r1_only) / n,
+            "retry_rescue_rate_given_replicate0_fail": r1_only / fail0 if fail0 else float("nan"),
+            "same_status_rate": (both + neither) / n,
+        }
+
+    summary = {
         "n_sources": n,
-        "both_replicates_strong_clean_rate": both_strong / n,
-        "purple_direction_consistency": purple_same_sign / n,
-        "orange_direction_consistency": orange_same_sign / n,
-        "mean_abs_purple_z_delta": sum(p_abs_delta) / len(p_abs_delta) if p_abs_delta else float("nan"),
-        "mean_abs_orange_z_delta": sum(o_abs_delta) / len(o_abs_delta) if o_abs_delta else float("nan"),
+        "watermark_pass": combo("watermark_pass"),
+        "generation_health_pass": combo("generation_health_pass"),
+        "literal_fidelity_pass": combo("literal_fidelity_pass"),
+        "detector_training_pass": combo("detector_training_pass"),
+        "strict_pair_pass": combo("strict_pair_pass"),
+        "purple_direction_consistency": purple_direction / n,
+        "orange_direction_consistency": orange_direction / n,
+        "purple_z_pearson_r": _pearson(p0, p1),
+        "orange_z_pearson_r": _pearson(o0, o1),
+        "mean_abs_purple_z_delta": sum(abs(a - b) for a, b in zip(p0, p1)) / len(p0) if p0 else float("nan"),
+        "mean_abs_orange_z_delta": sum(abs(a - b) for a, b in zip(o0, o1)) / len(o0) if o0 else float("nan"),
+        # Backwards-compatible key used by the v2 report.
+        "both_replicates_strong_clean_rate": sum(bool(a["strict_pair_pass"]) and bool(b["strict_pair_pass"]) for _, a, b in paired) / n,
     }
+    return summary, sorted(detail_rows, key=lambda x: x["global_pair_id"])
+
+
+def _robustness_summary(decisions: Sequence[dict]) -> dict:
+    return _robustness_details(decisions)[0]
 
 
 def assemble_bank(output_dir: str | Path, config: dict) -> dict:
@@ -234,6 +354,7 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
 
     decisions = build_bank_decisions(rows, config)
     records = _pair_records(rows, decisions)
+    robustness_summary, robustness_details = _robustness_details(decisions)
     canonical_decisions = [d for d in decisions if int(d["replicate"]) == 0]
     canonical_keys = {d["sample_key"] for d in canonical_decisions}
     strong_keys = {d["sample_key"] for d in canonical_decisions if d["strong_and_clean"]}
@@ -244,9 +365,14 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
     write_jsonl(outdir / "bank_strong_rows.jsonl", _rows_for_samples(rows, strong_keys, include_control=True))
     write_jsonl(outdir / "bank_strong_watermarked.jsonl", _rows_for_samples(rows, strong_keys, include_control=False))
     write_jsonl(outdir / "bank_rejected_rows.jsonl", _rows_for_samples(rows, rejected_keys, include_control=True))
+    detector_keys_all = {d["sample_key"] for d in decisions if d.get("detector_training_pass", False)}
+    detector_keys_canonical = {d["sample_key"] for d in canonical_decisions if d.get("detector_training_pass", False)}
+    write_jsonl(outdir / "bank_detector_eligible_rows.jsonl", _rows_for_samples(rows, detector_keys_all, include_control=False))
+    write_jsonl(outdir / "bank_detector_eligible_canonical.jsonl", _rows_for_samples(rows, detector_keys_canonical, include_control=False))
     write_jsonl(outdir / "robustness_rows.jsonl", _rows_for_samples(rows, robustness_keys, include_control=True))
     write_jsonl(outdir / "pair_decisions.jsonl", decisions)
     write_jsonl(outdir / "pair_records_all.jsonl", records)
+    write_jsonl(outdir / "robustness_by_source.jsonl", robustness_details)
 
     fold_assignments = []
     seen_sources = set()
@@ -331,7 +457,14 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
         "strong_clean": strong_summary,
         "by_default_split": by_split,
         "by_fold": by_fold,
-        "robustness": _robustness_summary(decisions),
+        "robustness": robustness_summary,
+        "canonical_flag_rates": {
+            "watermark_pass": _flag_rate(canonical_decisions, "watermark_pass"),
+            "generation_health_pass": _flag_rate(canonical_decisions, "generation_health_pass"),
+            "literal_fidelity_pass": _flag_rate(canonical_decisions, "literal_fidelity_pass"),
+            "detector_training_pass": _flag_rate(canonical_decisions, "detector_training_pass"),
+            "strict_pair_pass": _flag_rate(canonical_decisions, "strict_pair_pass"),
+        },
         "rejection_reason_counts": dict(Counter(reason for d in rejected for reason in d["hard_reject_reasons"])),
         "validation": {
             "gate_status": gate_status,
@@ -350,12 +483,17 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
         f"Sampler: symmetric fixed +/-{config['strength']:g} bias, temperature {config['temperature']:g}, full softmax, no truncation/gating.",
         f"Source filter: English, {config['min_source_tokens']}–{config['max_source_tokens']} Qwen tokens.",
         f"Reusable assignment: `fold = SHA256(source_id) mod 10`; default split is folds 0–7 train, 8 val, 9 test.",
-        f"Strong-pair criterion: purple z >= +{config['z_threshold']:g}, orange z <= -{config['z_threshold']:g}, plus existing hard quality checks.",
+        f"Watermark criterion: purple z >= +{config['z_threshold']:g}, orange z <= -{config['z_threshold']:g}.",
+        "Acceptance flags are stored separately: watermark strength, generation health, and literal fidelity.",
         "",
         "## Bank retention",
         "",
         f"- canonical source pairs: **{len(canonical_decisions)}**",
-        f"- strong + clean pairs: **{len(strong_keys)}** ({len(strong_keys)/max(1,len(canonical_decisions)):.1%})",
+        f"- watermark-pass pairs: **{sum(bool(d.get('watermark_pass')) for d in canonical_decisions)}** ({summary['canonical_flag_rates']['watermark_pass']:.1%})",
+        f"- generation-health-pass pairs: **{sum(bool(d.get('generation_health_pass')) for d in canonical_decisions)}** ({summary['canonical_flag_rates']['generation_health_pass']:.1%})",
+        f"- literal-fidelity-pass pairs: **{sum(bool(d.get('literal_fidelity_pass')) for d in canonical_decisions)}** ({summary['canonical_flag_rates']['literal_fidelity_pass']:.1%})",
+        f"- detector-eligible pairs (watermark + health): **{sum(bool(d.get('detector_training_pass')) for d in canonical_decisions)}** ({summary['canonical_flag_rates']['detector_training_pass']:.1%})",
+        f"- strict pairs (all three): **{len(strong_keys)}** ({len(strong_keys)/max(1,len(canonical_decisions)):.1%})",
         f"- independent-seed robustness sources: **{summary['robustness'].get('n_sources', 0)}**",
         "",
         "## Canonical statistical detector metrics",
@@ -385,11 +523,23 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
     lines += ["", "## Robustness panel", ""]
     if summary["robustness"].get("n_sources", 0):
         r = summary["robustness"]
+        wm = r["watermark_pass"]
+        strict = r["strict_pair_pass"]
+        det = r["detector_training_pass"]
         lines += [
-            f"- sources with replicate 0 + 1: {r['n_sources']}",
-            f"- both replicates strong + clean: {r['both_replicates_strong_clean_rate']:.1%}",
-            f"- purple direction consistency: {r['purple_direction_consistency']:.1%}",
-            f"- orange direction consistency: {r['orange_direction_consistency']:.1%}",
+            f"- sources with replicate 0 + 1: **{r['n_sources']}**",
+            f"- watermark pass, replicate 0: **{wm['replicate0_rate']:.1%}**",
+            f"- watermark pass, replicate 1: **{wm['replicate1_rate']:.1%}**",
+            f"- watermark pass, best of two: **{wm['at_least_one_rate']:.1%}**",
+            f"- P(watermark rescued by retry | replicate 0 failed): **{wm['retry_rescue_rate_given_replicate0_fail']:.1%}**",
+            f"- detector-eligible, replicate 0: **{det['replicate0_rate']:.1%}**; best of two: **{det['at_least_one_rate']:.1%}**",
+            f"- strict pass, replicate 0: **{strict['replicate0_rate']:.1%}**; replicate 1: **{strict['replicate1_rate']:.1%}**; best of two: **{strict['at_least_one_rate']:.1%}**",
+            f"- strict outcome counts: both={strict['both']}, r0-only={strict['replicate0_only']}, r1-only={strict['replicate1_only']}, neither={strict['neither']}",
+            f"- P(strict rescued by retry | replicate 0 failed): **{strict['retry_rescue_rate_given_replicate0_fail']:.1%}**",
+            f"- purple direction consistency: **{r['purple_direction_consistency']:.1%}**",
+            f"- orange direction consistency: **{r['orange_direction_consistency']:.1%}**",
+            f"- purple z seed correlation: **{r['purple_z_pearson_r']:.3f}**",
+            f"- orange z seed correlation: **{r['orange_z_pearson_r']:.3f}**",
         ]
     else:
         lines.append("- no independent-seed robustness replicates requested")
@@ -401,6 +551,43 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
         lines.append("- none")
     (outdir / "bank_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    rob_lines = [
+        "# Two-seed robustness analysis",
+        "",
+        "This report compares replicate 0 and replicate 1 for the same underlying Lyra source.",
+        "Both raw attempts are retained; `best of two` is an analysis statistic, not destructive replacement.",
+        "",
+    ]
+    if robustness_summary.get("n_sources", 0):
+        r = robustness_summary
+        for flag, label in (("watermark_pass", "Watermark pass"), ("detector_training_pass", "Detector eligible"), ("strict_pair_pass", "Strict pass")):
+            x = r[flag]
+            rob_lines += [
+                f"## {label}",
+                "",
+                f"- replicate 0: {x['replicate0_rate']:.1%}",
+                f"- replicate 1: {x['replicate1_rate']:.1%}",
+                f"- best of two: {x['at_least_one_rate']:.1%}",
+                f"- both: {x['both']}; replicate-0 only: {x['replicate0_only']}; replicate-1 only: {x['replicate1_only']}; neither: {x['neither']}",
+                f"- retry rescue rate conditional on replicate-0 failure: {x['retry_rescue_rate_given_replicate0_fail']:.1%}",
+                f"- same pass/fail status across seeds: {x['same_status_rate']:.1%}",
+                "",
+            ]
+        rob_lines += [
+            "## Continuous watermark strength",
+            "",
+            f"- purple direction consistency: {r['purple_direction_consistency']:.1%}",
+            f"- orange direction consistency: {r['orange_direction_consistency']:.1%}",
+            f"- purple z Pearson r: {r['purple_z_pearson_r']:.3f}",
+            f"- orange z Pearson r: {r['orange_z_pearson_r']:.3f}",
+            f"- mean |Δ purple z|: {r['mean_abs_purple_z_delta']:.2f}",
+            f"- mean |Δ orange z|: {r['mean_abs_orange_z_delta']:.2f}",
+            "",
+        ]
+    else:
+        rob_lines.append("No sources currently have both replicate 0 and replicate 1.")
+    (outdir / "robustness_analysis.md").write_text("\n".join(rob_lines) + "\n", encoding="utf-8")
+
     accepted_records = [r for r in records if int(r["replicate"]) == 0 and (r.get("decision") or {}).get("strong_and_clean")]
     rejected_records = [r for r in records if int(r["replicate"]) == 0 and not (r.get("decision") or {}).get("strong_and_clean")]
     robustness_records = [r for r in records if int(r["replicate"]) > 0]
@@ -411,7 +598,9 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
     files_to_hash = [
         "sources.jsonl", "partition.npz", "partition_meta.json", "partition_validation.json", "partition_spec.json",
         "bank_all_rows.jsonl", "bank_strong_rows.jsonl", "bank_strong_watermarked.jsonl", "bank_rejected_rows.jsonl",
-        "robustness_rows.jsonl", "pair_decisions.jsonl", "pair_records_all.jsonl", "fold_assignments.jsonl", "bank_summary.json",
+        "robustness_rows.jsonl", "robustness_by_source.jsonl", "robustness_analysis.md",
+        "bank_detector_eligible_rows.jsonl", "bank_detector_eligible_canonical.jsonl",
+        "pair_decisions.jsonl", "pair_records_all.jsonl", "fold_assignments.jsonl", "bank_summary.json",
     ]
     hashes = {}
     for name in files_to_hash:
@@ -419,7 +608,7 @@ def assemble_bank(output_dir: str | Path, config: dict) -> dict:
         if p.exists():
             hashes[name] = sha256_file(p)
     manifest = {
-        "dataset_format_version": "modal-watermark-bank-v2",
+        "dataset_format_version": "modal-watermark-bank-v2.1",
         "run_stage": config.get("run_stage", "poc"),
         "frozen": False,
         "config_hash": canonical_json_hash(config),
