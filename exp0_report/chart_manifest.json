@@ -1,0 +1,29 @@
+{
+  "summary": "runs/exp0_v2_data/data_summary.json",
+  "data_dir": "runs/exp0_v2_data",
+  "frozen": "runs/exp0_v2_suffix_frozen/metrics.json",
+  "joint": "runs/exp0_v2_suffix_joint/metrics.json",
+  "layer_probes": null,
+  "charts": [
+    "01_unwatermarked_balance.png",
+    "02_watermark_class_separation.png",
+    "03_signed_z_scores.png",
+    "04_colored_token_fraction.png",
+    "05_count_detector_accuracy.png",
+    "06_strength_pilot_fractions.png",
+    "07_strength_pilot_detectability.png",
+    "08_validation_accuracy.png",
+    "09_training_loss.png",
+    "10_validation_loss.png",
+    "11_frozen_validation_probability_separation.png",
+    "12_joint_validation_probability_separation.png",
+    "13_test_accuracy_comparison.png",
+    "14_test_probability_separation.png",
+    "15_frozen_test_confusion_matrix.png",
+    "16_joint_test_confusion_matrix.png",
+    "17_raw_fraction_distributions.png",
+    "18_raw_zscore_distributions.png",
+    "19_control_distribution.png"
+  ],
+  "report": "EXPERIMENT_0.md"
+}
