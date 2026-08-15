@@ -1,159 +1,113 @@
-# Watermark sprint v4 — exact-distribution KL sampler
+# Watermark sampler v5.1 — broad lexical eligibility
 
-This revision fixes the main flaw found in the v3 KL pilot: v3 measured KL on the full softmax and then let Hugging Face apply top-k/top-p afterwards. That meant the processor could spend its KL budget moving probability on tokens that were later discarded, so larger watermark strength sometimes changed diagnostics without changing sampled text.
+This package validates an **external fixed-bias purple/orange watermark sampler** on Lyra SynthPrompts rewrites. It does not train a watermarker or detector.
 
-V4 makes the sampling operation atomic:
+## What changed from v5
 
-1. model logits
-2. temperature
-3. top-k / top-p truncation
-4. normalize to the **actual unwatermarked sampling distribution** `p0`
-5. quality gates (entropy + color availability)
-6. choose the largest color tilt `delta` satisfying `KL(q || p0) <= epsilon`
-7. sample **directly from q**
+v5 had a serious coverage mistake: an otherwise normal lexical token became neutral when it appeared fewer than two times in a small calibration corpus. It also neutralized the 64 most frequent lexical pieces and a 5% hyperplane margin. That left much of Qwen's useful next-token probability mass untouched by the watermark.
 
-There are no later sampling warpers that can erase the watermark intervention.
+v5.1 fixes that:
 
-## Quality protection added in v4
+- every surface-safe Latin lexical token can be purple or orange, **including tokens unseen in calibration**;
+- calibration frequency is used only to place the embedding-hyperplane threshold at approximately 50/50 natural token mass;
+- `eligible_min_count=0` by default;
+- `neutral_top_k=0` by default;
+- `neutral_margin_mass=0` by default;
+- normal punctuation attached to lexical pieces (for example `word,`) is eligible;
+- punctuation-only, digits, symbols/emoji, non-Latin/mixed-script pieces, controls and special tokens remain neutral;
+- fixed symmetric +/- color bias and full-softmax sampling are unchanged;
+- KL remains a diagnostic only.
 
-The watermark channel now uses a conservative English lexical eligibility set. It excludes special/control tokens, whitespace-only and punctuation-only pieces, digits, symbols/emoji, non-Latin/mixed-script pieces, very rare/unseen pieces, and a small number of the most frequent lexical tokens. Those tokens remain available to the model as neutral tokens; they are simply not pushed by the watermark.
+The optional min-count/top-k/margin switches remain available for ablations, but they are no longer the defaults.
 
-Watermark pressure is also disabled at low-entropy decoding steps or when the actual top-k/top-p support does not contain enough baseline probability mass on both colors. Difficult positions are allowed to remain unwatermarked rather than being forced into odd text.
-
-The embedding hyperplane is still frequency-balanced on untouched Lyra prompts, and weak training pairs can still be filtered by their achieved z-score. Validation/test remain unfiltered.
-
-## First run: small KL pilot
+## Run the validation
 
 ```bash
-unzip watermark_sprint_v4.zip
-cd watermark_sprint_v4
+unzip watermark_sampler_v5_1.zip
+cd watermark_sampler_v5_1
 
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pip
 pip install -e . pytest
 pytest -q
 
-./run_lyra_actual_kl_pilot.sh
+./run_fixed_bias_validation.sh
 ```
 
-Defaults:
-
-- model: `Qwen/Qwen3-1.7B`
-- 32 underlying Lyra prompts per setting
-- KL budgets: `0.02 0.04 0.08` nats/token
-- maximum tilt: `12`
-- top-k: `50`
-- top-p: `0.95`
-- temperature: `0.9`
-- entropy gate: `>= 1.5` nats
-- baseline mass required on each color: `>= 0.02`
-- total eligible/color mass required: `>= 0.08`
-- 64 most frequent otherwise-eligible lexical tokens made neutral
-
-The pilot writes:
+Default validation settings:
 
 ```text
-runs/lyra_actual_kl_pilot/
-  kl_0p02/
-    data_summary.json
-    examples_side_by_side.md
-    ...
-  kl_0p04/
-  kl_0p08/
-  summary/
-    pilot_summary.csv
-    pilot_summary.md
+model                 Qwen/Qwen3-1.7B
+temperature           0.9
+sampling truncation   none
+symmetric bias        yes
+entropy gate          off
+top-k gate            off
+strengths             1.0, 1.5, 2.0, 2.5, 3.0
+calibration rewrites  256
+held-out controls      64
+eval Lyra prompts      64
+eligible min count      0
+neutral top-k           0
+neutral margin mass     0
 ```
 
-Read `summary/pilot_summary.md`, then inspect each `examples_side_by_side.md`.
+Output goes to `runs/fixed_bias_validation_v5_1/`.
 
-### Useful overrides
-
-```bash
-PAIRS=64 BUDGETS="0.02 0.04 0.08 0.12" ./run_lyra_actual_kl_pilot.sh
-```
-
-```bash
-MIN_ENTROPY_NATS=1.0 MIN_COLOR_MASS=0.01 ./run_lyra_actual_kl_pilot.sh
-```
-
-Do not change many knobs at once. The first question is whether increasing the *actual* KL budget now monotonically changes purple/orange token statistics while keeping the rewrites natural.
-
-## What the new diagnostics mean
-
-Each generated row now records, among other fields:
-
-- `mean_step_kl`: actual `KL(q || p0)` on the distribution sampled from
-- `mean_step_tv`: total-variation distance between `q` and `p0`
-- `fraction_steps_watermark_active`: fraction of generated positions where quality gates permitted watermarking
-- `fraction_steps_low_entropy`
-- `fraction_steps_insufficient_color_mass`
-- `fraction_steps_insufficient_eligible_mass`
-- `fraction_active_steps_kl_limited`: watermark-active steps where KL, rather than the max-tilt ceiling, limited the intervention
-- `fraction_active_steps_at_tilt_cap`
-- `mean_baseline_target_mass` / `mean_baseline_opposite_mass`
-- `fraction_sampled_target_color` / `fraction_sampled_opposite_color`
-
-For a healthy setting we would like:
-
-- purple z positive and orange z negative;
-- stronger separation as the KL budget rises;
-- actual KL below the requested budget by construction;
-- a meaningful fraction of watermark-active steps;
-- many active steps KL-limited rather than max-tilt-limited;
-- clean side-by-side rewrites without the multilingual/emoji artifacts seen in the early forced-watermark pilot.
-
-Some prompts will remain weakly watermarkable. That is expected and desirable: the generator should preserve coherence instead of forcing every example to carry a strong bit.
-
-## Full 2x data generation
-
-Only after choosing a good KL setting from the pilot:
-
-```bash
-KL_BUDGET=0.04 ./run_lyra_actual_kl_datagen.sh
-```
-
-The full script defaults to 1,000 underlying Lyra prompts, twice the original 500-pair Experiment 0 scale. It generates both purple and orange rewrites of every source prompt. Training pairs are kept only when both directions satisfy the default `|z| >= 1.5` criterion; validation/test are not filtered.
-
-Important output files:
+The main files are:
 
 ```text
-runs/exp0_lyra_actual_kl_data/
-  examples_side_by_side.md
-  data_summary.json
-  partition.npz
-  partition_meta.json
-  train_all.jsonl
-  train.jsonl
-  train_rejected_weak.jsonl
-  val.jsonl
-  test.jsonl
+validation_summary.md
+validation_summary.csv
+validation_summary.json
+partition.npz
+partition_meta.json
+heldout_control_rewrites.jsonl
+strength_*/purple.jsonl
+strength_*/orange.jsonl
+strength_*/examples_side_by_side.md
 ```
 
-## Existing detector training
+## What should improve
 
-The existing detector scripts still accept the generated `train.jsonl`, `val.jsonl`, and `test.jsonl`. Point `DATA` at the v4 directory when we are ready to train the recognition model again.
+Compared with v5, the first thing to inspect is `partition_meta.json`. The eligibility metadata now reports `eligible_unseen_token_count`; this should be large because normal lexical vocabulary types are no longer discarded merely for being absent from calibration.
 
-## Methodological note
+The statistical target remains:
 
-This sampler is intentionally close to the earlier KL + color-loss idea:
+- held-out unwatermarked rewrites close to 50/50 purple/orange;
+- purple mean z clearly positive and orange mean z clearly negative;
+- count accuracy around >=95% and AUC around >=0.98 at a usable strength;
+- reasonably symmetric displacement;
+- low exact-identical purple/orange pair rate;
+- no obvious increase in mixed-script, emoji/symbol, repetition, or semantic drift relative to unwatermarked rewrite controls.
 
-- `p0` plays the role of the frozen-model anchor;
-- the color tilt plays the role of the color objective;
-- the KL constraint controls how far the actual next-token distribution may move;
-- entropy/color-availability gating prevents the watermark from fighting low-entropy grammatical or factual choices.
+If the first 64-prompt run looks promising, increase `PAIRS`, `CALIBRATION`, and `CONTROL` rather than changing sampler mechanics immediately.
 
-The key difference is that this is used for **data generation**, not for training a separate watermarker model. That keeps the next experiment simpler and avoids adding another learned model before the behavioral feature-competition experiment.
+## Optional ablations
 
-## V4.1 diagnostic: open the sampling support
-
-If the v4 pilot reports a sampling support near one token and almost no effective watermarking,
-run the fixed-KL support sweep:
+The old restrictive settings can still be reproduced approximately:
 
 ```bash
-./run_lyra_support_sweep.sh
+NEUTRAL_TOP_K=64 \
+ELIGIBLE_MIN_COUNT=2 \
+NEUTRAL_MARGIN_MASS=0.05 \
+PAIRS=32 CALIBRATION=128 CONTROL=32 \
+OUTPUT=runs/v5_restriction_control \
+./run_fixed_bias_validation.sh
 ```
 
-Defaults: KL=0.04, top_k=0, top_p in {0.95, 0.99, 0.999, 1.0}, and the entropy/color-mass/eligible-mass gates disabled for this diagnostic.
-Eligibility filtering remains enabled. The report is written to `runs/lyra_support_sweep/summary/`.
+This provides a direct A/B check that lexical coverage, rather than the fixed-bias sampler itself, caused the weak v5 watermark.
+
+## Later dataset generation
+
+Do not generate the large dataset until validation passes. Once a strength is selected:
+
+```bash
+python scripts/generate_fixed_bias_dataset.py \
+  --partition-dir runs/fixed_bias_validation_v5_1 \
+  --strength <validated-strength> \
+  --pairs 1000 \
+  --output runs/lyra_fixed_bias_data
+```
+
+Training-only weak-pair filtering remains available through `--train-min-abs-z`; validation and test keep the weak tail.

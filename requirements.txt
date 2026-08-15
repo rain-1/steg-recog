@@ -1,9 +1,9 @@
-# Install a CUDA-enabled PyTorch build separately if your Lambda image does not already include one.
+torch
 transformers>=5.14.0,<5.16
 tokenizers>=0.22
 accelerate>=1.10
 safetensors>=0.6
 numpy>=2.0
 tqdm>=4.66
-pytest>=8.0
 datasets>=3.0
+pytest>=8

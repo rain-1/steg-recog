@@ -17,12 +17,19 @@ def _is_latin_letter(ch: str) -> bool:
     return "LATIN" in unicodedata.name(ch, "")
 
 
-def is_english_lexical_piece(piece: str, *, max_chars: int = 32) -> tuple[bool, str]:
-    """Conservative eligibility test for a single decoded token piece.
+def is_english_lexical_piece(piece: str, *, max_chars: int = 48) -> tuple[bool, str]:
+    """Surface-quality eligibility test for a decoded token piece.
 
-    The watermark should operate on ordinary lexical choices, not punctuation,
-    numbers, control tokens, emoji, or mixed-script Unicode. Leading/trailing
-    whitespace is fine because many BPE tokens encode it together with a word.
+    A token is eligible when it contains at least one Latin letter and contains
+    no digits, symbols/emoji, control characters, or non-Latin letters. Normal
+    punctuation attached to a lexical piece is allowed (for example ``word,``
+    or ``foo_bar``); punctuation-only pieces remain neutral because they contain
+    no Latin letter. Leading/trailing whitespace is also allowed.
+
+    Crucially, eligibility does *not* depend on whether the token appeared in the
+    calibration corpus. Calibration frequency is used to place the hyperplane
+    threshold, not to decide whether an otherwise ordinary lexical token gets a
+    color.
 
     Returns ``(eligible, reason)`` where ``reason`` is useful for diagnostics.
     """
@@ -60,7 +67,10 @@ def is_english_lexical_piece(piece: str, *, max_chars: int = 32) -> tuple[bool, 
         if category.startswith("S"):
             return False, "symbol"
         if category.startswith("P"):
-            return False, "punctuation"
+            # Punctuation attached to a word is harmless and often part of a
+            # normal BPE token. Punctuation-only pieces are rejected below by
+            # the has_latin requirement.
+            continue
         return False, "other"
 
     if not has_latin:
@@ -93,17 +103,19 @@ def build_english_lexical_eligibility(
     token_counts: Sequence[float] | np.ndarray,
     *,
     vocab_size: int,
-    neutral_top_k: int = 64,
-    min_count: int = 2,
-    max_piece_chars: int = 32,
+    neutral_top_k: int = 0,
+    min_count: int = 0,
+    max_piece_chars: int = 48,
 ) -> tuple[np.ndarray, dict]:
-    """Build a conservative eligible-token mask for English prompt rewriting.
+    """Build the eligible-token mask for English prompt rewriting.
 
-    Eligibility is deliberately based on *surface quality* rather than watermark
-    color. We keep ordinary Latin lexical pieces, then remove rare/unseen pieces,
-    special tokens, and the most frequent lexical tokens. The latter become
-    neutral so the watermark does not try to encode its bit by repeatedly
-    perturbing function words.
+    Eligibility is based on surface quality, not calibration frequency. Ordinary
+    Latin lexical pieces remain eligible even when unseen in calibration. This is
+    important: a small calibration sample should estimate the *frequency-mass
+    balancing threshold*, not permanently neutralize most of the model vocabulary.
+
+    ``min_count`` and ``neutral_top_k`` are retained as optional ablation knobs,
+    but both default to zero.
     """
     counts = np.asarray(token_counts, dtype=np.float64)
     if counts.shape != (vocab_size,):
@@ -130,7 +142,8 @@ def build_english_lexical_eligibility(
 
     low_frequency = mask & (counts < float(min_count))
     reasons["below_min_count"] += int(low_frequency.sum())
-    mask[low_frequency] = False
+    if min_count > 0:
+        mask[low_frequency] = False
 
     # Neutralize the most frequent *otherwise eligible* pieces. This is much less
     # destructive than v3's unconditional top-256 neutralization over all tokens.
@@ -146,11 +159,13 @@ def build_english_lexical_eligibility(
     eligible_mass = float(counts[mask].sum())
     observed_types = int((counts > 0).sum())
     observed_eligible_types = int((mask & (counts > 0)).sum())
+    unseen_eligible_types = int((mask & (counts == 0)).sum())
 
     metadata = {
-        "kind": "english_lexical_v1",
+        "kind": "english_lexical_v2_surface_only",
         "eligible_token_count": int(mask.sum()),
         "eligible_observed_token_count": observed_eligible_types,
+        "eligible_unseen_token_count": unseen_eligible_types,
         "observed_token_count": observed_types,
         "calibration_total_token_mass": total_mass,
         "calibration_eligible_token_mass": eligible_mass,

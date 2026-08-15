@@ -3,9 +3,9 @@ requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wmsteg-sprint"
-version = "0.4.0"
-description = "Exact-distribution KL-constrained purple/orange watermark experiments on Lyra SynthPrompts"
+name = "wmsteg-sampler-validation"
+version = "0.5.1"
+description = "Fixed-bias purple/orange watermark validation with broad lexical eligibility"
 requires-python = ">=3.10"
 dependencies = [
   "transformers>=5.14.0,<5.16",
