@@ -145,3 +145,15 @@ This sampler is intentionally close to the earlier KL + color-loss idea:
 - entropy/color-availability gating prevents the watermark from fighting low-entropy grammatical or factual choices.
 
 The key difference is that this is used for **data generation**, not for training a separate watermarker model. That keeps the next experiment simpler and avoids adding another learned model before the behavioral feature-competition experiment.
+
+## V4.1 diagnostic: open the sampling support
+
+If the v4 pilot reports a sampling support near one token and almost no effective watermarking,
+run the fixed-KL support sweep:
+
+```bash
+./run_lyra_support_sweep.sh
+```
+
+Defaults: KL=0.04, top_k=0, top_p in {0.95, 0.99, 0.999, 1.0}, and the entropy/color-mass/eligible-mass gates disabled for this diagnostic.
+Eligibility filtering remains enabled. The report is written to `runs/lyra_support_sweep/summary/`.
