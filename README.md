@@ -1,171 +1,124 @@
-# Parallel final watermark datagen on Modal
+# Modal watermark research-bank datagen (v2)
 
-This package turns the validated v5.2 sampler into the final long-form Lyra data-generation pipeline. It does **not** train a watermarker and it does **not** train the watermark detector. Its job is only to produce and validate the frozen purple/orange corpus that the detector will be trained on next.
+This package generates a reusable paired purple/orange Lyra prompt bank for the watermark-recognition and later feature-generalization experiments. It deliberately defaults to **small proof-of-concept runs**. Nothing produced by `smoke`, `poc`, or `pilot` is marked frozen.
 
-## Frozen watermark settings
+## What changed from v1
 
-The defaults are the settings that passed the latest validation:
+- Modal class-parameter annotation fix is included (`modal_app.py` does not use postponed annotations).
+- Hugging Face access uses a Modal Secret named `huggingface-secret` containing `HF_TOKEN`; no token is passed on the run command.
+- Source assignment is now reusable: `fold = SHA256(source_id) mod 10`.
+  - default compatibility split: folds 0–7 train, fold 8 val, fold 9 test.
+- Main source selection round-robins across `(mode, topic)` buckets to keep PoCs broad without imposing a permanent synthetic distribution.
+- Every source retains Lyra metadata plus exact source token ids.
+- Every generated condition retains exact generated token ids, eligible/colored-token counts, z score, generation seed/batch id, model/tokenizer revision, partition spec hash, and partition-file SHA256.
+- Weak/rejected generations are retained, not discarded.
+- Optional independent-seed replicates create a small robustness panel.
+- The assembler writes a reusable bank, not a capped `800/100/100` detector dataset.
 
-- model/tokenizer: `Qwen/Qwen3-1.7B`
-- Lyra: `lyraaaa/synthprompts_v2_250k`, English
-- source length: **96–320 Qwen tokens**
-- watermark strength: **5.0**
-- temperature: **0.9**
-- full-softmax sampling; no top-p/top-k truncation
-- symmetric target/opposite bias
-- no entropy gate
-- no top-k gate
-- broad English lexical eligibility (`min_count=0`, `neutral_top_k=0`, `neutral_margin_mass=0`)
-- partition calibrated on **256 ordinary Qwen rewrites**, with **64 separate ordinary rewrites** as the baseline control
-- partition seed `1234`
-- paired watermark criterion: purple `z >= +1.5`, orange `z <= -1.5`
-
-The partition is built once, baseline-validated, written to a persistent Modal Volume, and then reused. Its exact model and dataset revisions are recorded. Later runs reuse those immutable revisions instead of silently following future Hugging Face `main` branches.
-
-## Why Modal is used this way
-
-There are two persistent Volumes:
-
-- `wmsteg-hf-cache` — model/cache files, downloaded once before GPU fan-out
-- `wmsteg-artifacts` — the frozen partition and its validation metadata
-
-GPU workers are a Modal `Cls`, so the Qwen model is loaded once when each container starts and then reused for many batches. The main source batches are sent through `.map()`, while `max_containers` is set from `--workers`. Thus `--workers 8` means at most eight GPU containers are active for this job.
-
-Results are streamed back to the machine running `modal run` and atomically written as one local file per completed batch. If the job is interrupted, rerunning the same command skips completed batch files. Do not delete `raw_batches/` until the dataset has been assembled and backed up.
-
-## 1. Install and authenticate
-
-From this directory:
+## One-time setup
 
 ```bash
-python -m pip install -r requirements-local.txt
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-local.txt
+pip install -e . pytest
 modal setup
 ```
 
-The Qwen model and Lyra dataset are public, so a Hugging Face token is not required. If you want to use one for rate limits, create a Modal Secret containing `HF_TOKEN`, then pass its secret name with `--hf-secret`.
+Create the Hugging Face secret once. If `HF_TOKEN` is already exported locally:
 
-## 2. Optional smoke run
+```bash
+modal secret create huggingface-secret HF_TOKEN="$HF_TOKEN"
+```
 
-This checks the complete path with two GPUs and 24 main sources:
+Or provide it directly once:
+
+```bash
+modal secret create huggingface-secret HF_TOKEN="hf_..."
+```
+
+The code automatically injects this secret into the two functions that access the Hub (`warm_hf_cache` and `prepare_sources`). GPU workers load the model from the persistent Modal cache.
+
+## Recommended progression
+
+### 1. Integration smoke test
 
 ```bash
 modal run modal_app.py::smoke --workers 2 --gpu A10
 ```
 
-If the frozen partition does not yet exist, the first invocation also creates it from the full 256 calibration + 64 held-out control rewrites. That one-time step is intentionally the same for smoke and production; the production run will then reuse it.
+24 canonical sources + 4 independent-seed repeats. This only checks plumbing.
 
-## 3. Production run
+### 2. First proof of concept
 
-Recommended starting command:
+```bash
+modal run modal_app.py::poc --workers 4 --gpu A10
+```
+
+128 canonical sources + 16 independent-seed repeats. Inspect `bank_summary.md`, accepted/rejected examples, fold balance, and robustness before doing anything larger.
+
+### 3. Second pilot
+
+Only after the 128-source PoC looks good:
+
+```bash
+modal run modal_app.py::pilot --workers 8 --gpu A10
+```
+
+512 canonical sources + 64 independent-seed repeats.
+
+### 4. Scale later, explicitly
+
+There is intentionally no large default. When the PoCs are satisfactory, use the generic entrypoint with explicit counts, for example:
 
 ```bash
 modal run modal_app.py::main \
-  --workers 8 \
+  --source-candidates 4000 \
+  --robustness-sources 256 \
+  --workers 16 \
   --gpu A10 \
-  --output runs/lyra_watermark_final_v1
+  --run-stage pre-freeze-scale \
+  --output runs/lyra_watermark_pre_freeze_scale
 ```
 
-Defaults:
+Only after reviewing that run should we make a frozen experiment manifest/dataset.
 
-- 1,500 long-form source candidates
-- 1,200 train candidates
-- 150 validation candidates
-- 150 test candidates
-- target final sets: 800 train pairs, 100 val pairs, 100 test pairs
-- generation batch size 4
+## Frozen watermark settings currently reused
 
-Each source gets three matched-seed rewrites: `control`, `purple`, and `orange`. With the default 1,500 sources that is 4,500 rewrites. The main run is split into about 376 independent GPU batch inputs and distributed across the requested GPU containers.
+The sampler itself remains the validated v5.2 configuration:
 
-To use more GPUs:
+- `Qwen/Qwen3-1.7B`
+- English Lyra sources, 96–320 Qwen tokens
+- strength 5.0
+- temperature 0.9
+- symmetric +/- color bias
+- full-softmax sampling
+- no top-p/top-k truncation
+- no entropy gate
+- no top-k gate
+- strong-pair criterion: purple z >= +1.5 and orange z <= -1.5
 
-```bash
-modal run modal_app.py::main --workers 16 --gpu A10 --output runs/lyra_watermark_final_v1
-```
+The existing Modal partition volume/tag is reused exactly. Each output records both its partition spec hash and the SHA256 of `partition.npz`.
 
-You can also choose another Modal GPU type, for example `L4` or `A100`, without changing the sampler. Keep one GPU type for the entire frozen run if you want the cleanest reproducibility record.
+## Important output files
 
-## 4. Resume after interruption
+- `sources.jsonl` — canonical source bank, fold assignment, metadata, exact source token ids
+- `bank_all_rows.jsonl` — every generated control/purple/orange row, including failures and replicate 1
+- `bank_strong_rows.jsonl` — control + purple + orange rows for accepted canonical pairs
+- `bank_strong_watermarked.jsonl` — accepted canonical purple/orange rows only
+- `bank_rejected_rows.jsonl` — all condition rows for rejected canonical pairs
+- `robustness_rows.jsonl` — independent-seed replicate rows
+- `pair_records_all.jsonl` — one nested record per source/replicate with all three conditions
+- `pair_decisions.jsonl` — z/quality acceptance decisions
+- `fold_assignments.jsonl` — compact source-to-fold manifest
+- `folds/fold_*_strong.jsonl` — accepted watermarked rows by reusable fold
+- `default_train_strong.jsonl`, `default_val_strong.jsonl`, `default_test_strong.jsonl`
+- `bank_summary.md` / `bank_summary.json`
+- `examples_accepted.md`, `examples_rejected.md`, `examples_robustness.md`
+- `manifest.json` — hashes and `"frozen": false`
 
-Rerun the **same command and output directory**. Completed files under `raw_batches/` are detected and skipped:
+## Reproducibility
 
-```bash
-modal run modal_app.py::main \
-  --workers 8 \
-  --gpu A10 \
-  --output runs/lyra_watermark_final_v1
-```
+Generation remains resumable by batch. Re-running the same command/output directory skips finished `raw_batches/batch_*.json` files. The output directory refuses to mix raw batches if generation-critical configuration changes.
 
-Changing worker count or GPU type is allowed when resuming. Changing anything that changes the generated examples—strength, data seed, candidate split, batch size, source-length bounds, partition, etc.—is refused if that directory already contains raw batches. Use a new output directory for a different generation configuration.
-
-## Output layout
-
-The important outputs are:
-
-```text
-runs/lyra_watermark_final_v1/
-├── partition.npz
-├── partition_meta.json
-├── partition_spec.json
-├── partition_validation.json
-├── generation_config.json
-├── manifest.json
-├── sources.jsonl
-├── raw_batches/
-│   ├── batch_00000.json
-│   └── ...
-├── control.jsonl
-├── train_all.jsonl
-├── train_strong_all.jsonl
-├── train.jsonl
-├── val_long_all.jsonl
-├── val_strong_all.jsonl
-├── val.jsonl
-├── test_long_all.jsonl
-├── test_strong_all.jsonl
-├── test.jsonl
-├── pair_decisions.jsonl
-├── rejected_pairs.jsonl
-├── examples_accepted.md
-├── examples_rejected.md
-├── data_summary.json
-└── data_summary.md
-```
-
-`train.jsonl`, `val.jsonl`, and `test.jsonl` contain only paired purple/orange examples that pass the z-score gate and the cheap hard quality checks. `val_long_all.jsonl` and `test_long_all.jsonl` deliberately retain the natural long-form weak tail so downstream detector evaluation is not defined only on hand-selected easy watermarks.
-
-## Hard quality checks
-
-The automatic rejection layer is intentionally simple. It rejects a pair if either colored rewrite has:
-
-- empty output
-- severe length contraction/expansion
-- generation that hits the maximum-token cap
-- replacement/control characters
-- obvious repeated-trigram or adjacent-word degeneration
-- changed numeric literals (formatting commas such as `5,000` vs `5000` are normalized)
-- changed backtick literals such as table/column/code identifiers
-
-Quoted-span changes and newly introduced non-Latin text are recorded as review flags rather than automatically rejected. There is no LLM judge in this stage.
-
-Every rejected pair and its reasons are retained in `rejected_pairs.jsonl`; nothing is silently discarded.
-
-## What to inspect when it finishes
-
-Start with:
-
-```text
-data_summary.md
-partition_validation.json
-examples_accepted.md
-examples_rejected.md
-```
-
-The final run should preserve the properties seen in the pilot: control text near a 50/50 baseline, large and symmetric positive/negative z shifts on sufficiently long text, high count-detector AUC, and a high strong-pair retention rate. `data_summary.md` includes explicit gates: main-control balance within ±0.04 of 0.5, `test_long_all` AUC >= 0.98, `test_long_all` count accuracy >= 0.95, relative purple/orange z-magnitude asymmetry <= 20%, and all requested final pair counts reached.
-
-If fewer than the requested 800/100/100 pairs survive, the code keeps all generated data and prints a warning. Increase the candidate counts in a **new output directory** rather than weakening the z threshold or quality gates immediately.
-
-## Rebuilding the partition
-
-Normally, do not do this. The partition is the feature we want to freeze.
-
-`--rebuild-partition` exists only for an intentional fresh experiment. If the methodology or model/dataset revision changes, use a new `PARTITION_TAG` in `modal_app.py` and a new output directory so the two experiments cannot be confused.
+The exact generated token ids are stored because batched stochastic generation can depend on the batching configuration even with fixed seeds. `batch_size`, batch id, seed, model revision, tokenizer revision, and partition hashes are therefore all preserved.

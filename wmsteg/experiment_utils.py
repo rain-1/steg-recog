@@ -73,6 +73,8 @@ def score_text(partition: TokenPartition, tokenizer, text: str) -> dict:
         "purple_tokens": p,
         "orange_tokens": o,
         "neutral_tokens": n,
+        "eligible_token_count": colored,
+        "colored_token_count": colored,
         "token_length": total,
         "colored_fraction_total": colored / max(1, total),
         "purple_fraction_colored": p / max(1, colored),
@@ -112,7 +114,13 @@ def make_output_row(
         "complexity": src.get("complexity"),
         "language": src.get("language"),
         "task_spec_level": src.get("task_spec_level"),
+        "lyra_metadata": src.get("lyra_metadata", {}),
         "source_token_length": int(src["source_token_length"]),
+        "source_token_ids": list(src.get("source_token_ids", [])),
+        "fold": int(src.get("fold", -1)),
+        "default_split": src.get("default_split", split),
+        "source_dataset": src.get("source_dataset"),
+        "source_dataset_revision": src.get("source_dataset_revision"),
     }
     row.update(score_text(partition, tokenizer, text))
     row["rewrite_length_ratio"] = row["token_length"] / max(1, row["source_token_length"])
@@ -293,7 +301,8 @@ def generate_rewrite_batch(
     rewrite_extra_tokens: int,
     max_new_tokens_cap: int,
     generator_seed: int,
-) -> tuple[list[str], list[dict]]:
+    return_token_ids: bool = False,
+):
     formatted = [apply_rewrite_chat(tokenizer, s["prompt"]) for s in batch_sources]
     max_source = max(int(s["source_token_length"]) for s in batch_sources)
     max_new = min(
@@ -311,7 +320,7 @@ def generate_rewrite_batch(
             gate_top_k=gate_top_k,
         ),
     )
-    texts, stats, _ = generate_with_fixed_bias(
+    texts, stats, token_ids = generate_with_fixed_bias(
         model,
         tokenizer,
         formatted,
@@ -319,6 +328,8 @@ def generate_rewrite_batch(
         max_new_tokens=max_new,
         generator_seed=generator_seed,
     )
+    if return_token_ids:
+        return texts, stats, token_ids
     return texts, stats
 
 
@@ -344,7 +355,8 @@ def generate_plain_rewrite_batch(
     rewrite_extra_tokens: int,
     max_new_tokens_cap: int,
     generator_seed: int,
-) -> tuple[list[str], list[dict]]:
+    return_token_ids: bool = False,
+):
     formatted = [apply_rewrite_chat(tokenizer, s["prompt"]) for s in batch_sources]
     max_source = max(int(s["source_token_length"]) for s in batch_sources)
     max_new = min(
@@ -352,7 +364,7 @@ def generate_plain_rewrite_batch(
         max(24, int(math.ceil(max_source * rewrite_max_ratio)) + rewrite_extra_tokens),
     )
     sampler = PlainFullSoftmaxSampler(PlainSamplingConfig(temperature=temperature))
-    texts, stats, _ = generate_with_fixed_bias(
+    texts, stats, token_ids = generate_with_fixed_bias(
         model,
         tokenizer,
         formatted,
@@ -360,6 +372,8 @@ def generate_plain_rewrite_batch(
         max_new_tokens=max_new,
         generator_seed=generator_seed,
     )
+    if return_token_ids:
+        return texts, stats, token_ids
     return texts, stats
 
 

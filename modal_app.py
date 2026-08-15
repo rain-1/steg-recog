@@ -1,5 +1,3 @@
-#from __future__ import annotations
-
 import hashlib
 import json
 import math
@@ -10,14 +8,18 @@ from typing import Any
 
 import modal
 
-APP_NAME = "wmsteg-final-datagen"
+APP_NAME = "wmsteg-bank-datagen"
 MODEL_ID = "Qwen/Qwen3-1.7B"
 DATASET_ID = "lyraaaa/synthprompts_v2_250k"
 DATASET_SPLIT = "train"
 
-# This tag names the *validated methodology*, not a particular main-dataset run.
-# Reusing it means later runs reuse exactly the same frozen partition on Modal.
+# Reuse the watermark partition that was already validated. The generated bank
+# itself is explicitly NOT frozen by this code; PoC/pilot runs are for deciding
+# what to freeze later.
 PARTITION_TAG = "qwen3-1p7b-v5p2-cal256-d2025-p1234"
+
+HF_SECRET_NAME = "huggingface-secret"
+HF_SECRET = modal.Secret.from_name(HF_SECRET_NAME, required_keys=["HF_TOKEN"])
 
 CACHE_MOUNT = "/cache"
 ARTIFACT_MOUNT = "/artifacts"
@@ -93,21 +95,23 @@ def frozen_partition_spec(model_revision: str, dataset_revision: str) -> dict:
 
 @app.function(
     image=image,
+    secrets=[HF_SECRET],
     volumes={CACHE_MOUNT: HF_CACHE},
     cpu=2,
     memory=8192,
     timeout=60 * 60,
 )
 def warm_hf_cache(model_revision: str = "", dataset_revision: str = "") -> dict:
-    """Download the model once and resolve immutable HF revisions."""
+    """Download the model once and resolve immutable Hugging Face revisions."""
     from huggingface_hub import HfApi, snapshot_download
 
-    model_path = snapshot_download(repo_id=MODEL_ID, revision=model_revision or None)
+    token = os.environ.get("HF_TOKEN")
+    model_path = snapshot_download(repo_id=MODEL_ID, revision=model_revision or None, token=token)
     resolved_model_revision = Path(model_path).name
     if dataset_revision:
         resolved_dataset_revision = dataset_revision
     else:
-        dataset_info = HfApi().dataset_info(DATASET_ID)
+        dataset_info = HfApi(token=token).dataset_info(DATASET_ID)
         resolved_dataset_revision = str(dataset_info.sha)
     HF_CACHE.commit()
     return {
@@ -119,6 +123,7 @@ def warm_hf_cache(model_revision: str = "", dataset_revision: str = "") -> dict:
 
 @app.function(
     image=image,
+    secrets=[HF_SECRET],
     volumes={CACHE_MOUNT: HF_CACHE},
     cpu=2,
     memory=8192,
@@ -128,21 +133,25 @@ def prepare_sources(
     model_revision: str,
     dataset_revision: str,
     source_candidates: int,
-    train_candidates: int,
-    val_candidates: int,
-    test_candidates: int,
     main_data_seed: int,
     min_source_tokens: int,
     max_source_tokens: int,
+    source_pool_multiplier: int,
 ) -> dict:
-    """Prepare calibration/control sources and split main sources before generation."""
+    """Prepare calibration sources and a reusable fold-assigned Lyra source bank."""
     from transformers import AutoTokenizer
-    from wmsteg.lyra import load_source_rows
+    from wmsteg.lyra import diverse_round_robin, load_source_rows, stable_fold, default_split_from_fold
 
-    if train_candidates + val_candidates + test_candidates != source_candidates:
-        raise ValueError("train_candidates + val_candidates + test_candidates must equal source_candidates")
+    if source_candidates < 1:
+        raise ValueError("source_candidates must be >= 1")
+    if source_pool_multiplier < 1:
+        raise ValueError("source_pool_multiplier must be >= 1")
 
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, revision=model_revision)
+    tok = AutoTokenizer.from_pretrained(
+        MODEL_ID,
+        revision=model_revision,
+        token=os.environ.get("HF_TOKEN"),
+    )
     tok.padding_side = "left"
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
@@ -163,10 +172,10 @@ def prepare_sources(
     control_sources = reserved[256:320]
     reserved_ids = {r["source_id"] for r in reserved}
 
-    # Pull extra rows so we can guarantee no source overlap with partition calibration.
+    pool_n = source_candidates * source_pool_multiplier + len(reserved_ids)
     pool = load_source_rows(
         tok,
-        n=source_candidates + len(reserved_ids),
+        n=pool_n,
         seed=main_data_seed,
         dataset_name=DATASET_ID,
         dataset_split=DATASET_SPLIT,
@@ -174,29 +183,32 @@ def prepare_sources(
         language="english",
         min_source_tokens=min_source_tokens,
         max_source_tokens=max_source_tokens,
-        shuffle_buffer=30_000,
+        shuffle_buffer=max(30_000, pool_n * 4),
     )
-    main_sources = [r for r in pool if r["source_id"] not in reserved_ids][:source_candidates]
+    pool = [r for r in pool if r["source_id"] not in reserved_ids]
+    main_sources = diverse_round_robin(pool, source_candidates, seed=main_data_seed, group_fields=("mode", "topic"))
     if len(main_sources) != source_candidates:
         raise RuntimeError(f"Only obtained {len(main_sources)} non-overlapping main sources")
 
-    split_bounds = [
-        ("train", 0, train_candidates),
-        ("val", train_candidates, train_candidates + val_candidates),
-        ("test", train_candidates + val_candidates, source_candidates),
-    ]
-    for split, lo, hi in split_bounds:
-        for split_idx, row in enumerate(main_sources[lo:hi]):
-            global_idx = lo + split_idx
-            row["split"] = split
-            row["split_pair_id"] = split_idx
-            row["global_pair_id"] = global_idx
+    split_counts = {"train": 0, "val": 0, "test": 0}
+    for global_idx, row in enumerate(main_sources):
+        fold = stable_fold(row["source_id"], 10)
+        split = default_split_from_fold(fold)
+        row["fold"] = fold
+        row["default_split"] = split
+        row["split"] = split  # compatibility only; folds are the primary assignment.
+        row["split_pair_id"] = split_counts[split]
+        row["global_pair_id"] = global_idx
+        row["source_dataset"] = DATASET_ID
+        row["source_dataset_revision"] = dataset_revision
+        split_counts[split] += 1
 
     return {
         "calibration_sources": cal_sources,
         "heldout_control_sources": control_sources,
         "main_sources": main_sources,
         "reserved_source_ids": sorted(reserved_ids),
+        "default_split_counts": split_counts,
     }
 
 
@@ -218,8 +230,10 @@ def fetch_partition(partition_tag: str, expected_spec_hash: str = "") -> dict | 
             f"Partition tag {tag} exists but spec hash differs: {spec.get('spec_hash')} != {expected_spec_hash}. "
             "Use a new partition tag rather than silently changing the feature."
         )
+    partition_bytes = (root / "partition.npz").read_bytes()
     return {
-        "partition_npz": (root / "partition.npz").read_bytes(),
+        "partition_npz": partition_bytes,
+        "partition_sha256": hashlib.sha256(partition_bytes).hexdigest(),
         "partition_meta": json.loads((root / "partition_meta.json").read_text(encoding="utf-8")),
         "partition_validation": json.loads((root / "partition_validation.json").read_text(encoding="utf-8")),
         "partition_spec": spec,
@@ -256,8 +270,6 @@ class PlainWorker:
             device_map="auto",
         )
         self.model.eval()
-        import torch
-        self.gpu_name = torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu"
 
     @modal.method()
     def generate_batch(self, task: dict) -> dict:
@@ -354,8 +366,8 @@ class PartitionBuilder:
                 "watermark_sampler": "full_softmax_fixed_color_bias",
                 "temperature": spec["temperature"],
                 "symmetric": True,
-                "frozen_partition_tag": tag,
-                "frozen_spec_hash": _spec_hash(spec),
+                "partition_tag": tag,
+                "partition_spec_hash": _spec_hash(spec),
             },
         )
         partition.save(root)
@@ -387,15 +399,17 @@ class PartitionBuilder:
         }
         validation["pass"] = all(validation["checks"].values())
         if not validation["pass"]:
-            raise RuntimeError(f"Frozen partition baseline validation failed: {validation}")
+            raise RuntimeError(f"Partition baseline validation failed: {validation}")
 
         stored_spec = {**spec, "spec_hash": _spec_hash(spec), "partition_tag": tag}
         (root / "partition_spec.json").write_text(json.dumps(stored_spec, indent=2, sort_keys=True), encoding="utf-8")
         (root / "partition_validation.json").write_text(json.dumps(validation, indent=2, sort_keys=True), encoding="utf-8")
         ARTIFACTS.commit()
 
+        partition_bytes = (root / "partition.npz").read_bytes()
         return {
-            "partition_npz": (root / "partition.npz").read_bytes(),
+            "partition_npz": partition_bytes,
+            "partition_sha256": hashlib.sha256(partition_bytes).hexdigest(),
             "partition_meta": json.loads((root / "partition_meta.json").read_text(encoding="utf-8")),
             "partition_validation": validation,
             "partition_spec": stored_spec,
@@ -443,6 +457,10 @@ class WatermarkWorker:
         self.partition = TokenPartition.load(root)
         if int(self.model.get_input_embeddings().weight.shape[0]) != self.partition.vocab_size:
             raise RuntimeError("partition vocabulary does not match loaded model")
+        partition_bytes = (root / "partition.npz").read_bytes()
+        self.partition_sha256 = hashlib.sha256(partition_bytes).hexdigest()
+        self.partition_spec = json.loads((root / "partition_spec.json").read_text(encoding="utf-8"))
+        self.partition_spec_hash = str(self.partition_spec.get("spec_hash", ""))
 
     @modal.method()
     def generate_batch(self, task: dict) -> dict:
@@ -451,18 +469,20 @@ class WatermarkWorker:
 
         batch = task["sources"]
         seed = int(task["seed"])
+        replicate = int(task.get("replicate", 0))
         common = dict(
             temperature=float(task["temperature"]),
             rewrite_max_ratio=float(task["rewrite_max_ratio"]),
             rewrite_extra_tokens=int(task["rewrite_extra_tokens"]),
             max_new_tokens_cap=int(task["max_new_tokens_cap"]),
             generator_seed=seed,
+            return_token_ids=True,
         )
 
-        control_texts, control_stats = generate_plain_rewrite_batch(
+        control_texts, control_stats, control_ids = generate_plain_rewrite_batch(
             self.model, self.tokenizer, batch, **common
         )
-        p_texts, p_stats = generate_rewrite_batch(
+        p_texts, p_stats, p_ids = generate_rewrite_batch(
             self.model,
             self.tokenizer,
             self.partition,
@@ -474,7 +494,7 @@ class WatermarkWorker:
             symmetric=True,
             **common,
         )
-        o_texts, o_stats = generate_rewrite_batch(
+        o_texts, o_stats, o_ids = generate_rewrite_batch(
             self.model,
             self.tokenizer,
             self.partition,
@@ -489,31 +509,39 @@ class WatermarkWorker:
 
         rows: list[dict] = []
         conditions = [
-            (None, control_texts, control_stats),
-            (PURPLE, p_texts, p_stats),
-            (ORANGE, o_texts, o_stats),
+            (None, control_texts, control_stats, control_ids),
+            (PURPLE, p_texts, p_stats, p_ids),
+            (ORANGE, o_texts, o_stats, o_ids),
         ]
-        for label, texts, stats in conditions:
-            for src, text, st in zip(batch, texts, stats):
+        for label, texts, stats, token_ids in conditions:
+            for src, text, st, generated_ids in zip(batch, texts, stats, token_ids):
+                pair_id = int(src["global_pair_id"]) + replicate * 10_000_000
                 row = make_output_row(
                     self.partition,
                     self.tokenizer,
                     src,
                     text=text,
                     label=label,
-                    split=src["split"],
-                    pair_id=int(src["global_pair_id"]),
+                    split=src["default_split"],
+                    pair_id=pair_id,
                     sampler_stats=st,
                     strength=0.0 if label is None else float(task["strength"]),
                 )
                 row["global_pair_id"] = int(src["global_pair_id"])
                 row["split_pair_id"] = int(src["split_pair_id"])
+                row["replicate"] = replicate
+                row["sample_key"] = f"{src['source_id']}:r{replicate}"
+                row["generated_token_ids"] = [int(x) for x in generated_ids]
                 row["generation_seed"] = seed
+                row["generation_batch_id"] = int(task["batch_id"])
                 row["model_revision"] = self.model_revision
+                row["tokenizer_revision"] = self.model_revision
                 row["partition_tag"] = self.partition_tag
+                row["partition_spec_hash"] = self.partition_spec_hash
+                row["partition_sha256"] = self.partition_sha256
                 row["gpu_name"] = self.gpu_name
                 rows.append(row)
-        return {"batch_id": int(task["batch_id"]), "rows": rows}
+        return {"batch_id": int(task["batch_id"]), "replicate": replicate, "rows": rows}
 
 
 def _batch_tasks(sources: list[dict], batch_size: int, *, seed_base: int, kind: str, cfg: dict) -> list[dict]:
@@ -535,31 +563,51 @@ def _batch_tasks(sources: list[dict], batch_size: int, *, seed_base: int, kind: 
     return tasks
 
 
-def _main_tasks(sources: list[dict], batch_size: int, cfg: dict) -> list[dict]:
+def _deterministic_robustness_sources(sources: list[dict], n: int, seed: int) -> list[dict]:
+    if n <= 0:
+        return []
+    if n > len(sources):
+        raise ValueError("robustness_sources cannot exceed source_candidates")
+
+    def key(row: dict) -> str:
+        return hashlib.sha256(f"{seed}:robustness:{row['source_id']}".encode("utf-8")).hexdigest()
+
+    return sorted(sources, key=key)[:n]
+
+
+def _main_tasks(sources: list[dict], robustness_sources: int, batch_size: int, cfg: dict) -> list[dict]:
     tasks: list[dict] = []
     batch_id = 0
-    # Do not mix splits inside a batch; this makes resume/debugging easier.
-    for split_idx, split in enumerate(("train", "val", "test")):
-        split_sources = [x for x in sources if x["split"] == split]
-        for start in range(0, len(split_sources), batch_size):
-            batch = split_sources[start:start + batch_size]
-            tasks.append({
-                "batch_id": batch_id,
-                "sources": batch,
-                "seed": int(cfg["main_data_seed"]) + 50_000 + split_idx * 100_000 + start,
-                "temperature": cfg["temperature"],
-                "strength": cfg["strength"],
-                "rewrite_max_ratio": cfg["rewrite_max_ratio"],
-                "rewrite_extra_tokens": cfg["rewrite_extra_tokens"],
-                "max_new_tokens_cap": cfg["max_new_tokens_cap"],
-            })
-            batch_id += 1
+
+    def add_source_set(rows: list[dict], replicate: int, seed_offset: int) -> None:
+        nonlocal batch_id
+        # Keep compatibility splits separate inside batches. Folds remain the
+        # actual reusable assignment and are saved on every row.
+        for split_idx, split in enumerate(("train", "val", "test")):
+            split_sources = [x for x in rows if x["default_split"] == split]
+            for start in range(0, len(split_sources), batch_size):
+                batch = split_sources[start:start + batch_size]
+                tasks.append({
+                    "batch_id": batch_id,
+                    "replicate": replicate,
+                    "sources": batch,
+                    "seed": int(cfg["main_data_seed"]) + seed_offset + split_idx * 100_000 + start,
+                    "temperature": cfg["temperature"],
+                    "strength": cfg["strength"],
+                    "rewrite_max_ratio": cfg["rewrite_max_ratio"],
+                    "rewrite_extra_tokens": cfg["rewrite_extra_tokens"],
+                    "max_new_tokens_cap": cfg["max_new_tokens_cap"],
+                })
+                batch_id += 1
+
+    add_source_set(sources, replicate=0, seed_offset=50_000)
+    robustness = _deterministic_robustness_sources(sources, robustness_sources, int(cfg["main_data_seed"]))
+    if robustness:
+        add_source_set(robustness, replicate=1, seed_offset=1_050_000)
     return tasks
 
 
-def _with_secret(obj: Any, hf_secret: str, **options: Any) -> Any:
-    if hf_secret:
-        options["secrets"] = [modal.Secret.from_name(hf_secret)]
+def _with_options(obj: Any, **options: Any) -> Any:
     return obj.with_options(**options) if options else obj
 
 
@@ -583,7 +631,7 @@ def _collect_plain(worker: Any, tasks: list[dict]) -> list[dict]:
         raise RuntimeError("plain generation failures:\n" + "\n".join(errors[:20]))
     items: list[dict] = []
     for task in sorted(tasks, key=lambda x: x["batch_id"]):
-        items.extend(by_batch[int(task["batch_id"])]["items"])
+        items.extend(by_batch[int(task["batch_id"])] ["items"])
     return items
 
 
@@ -605,41 +653,37 @@ def _run(
     output: str,
     workers: int,
     gpu: str,
-    hf_secret: str,
     source_candidates: int,
-    train_candidates: int,
-    val_candidates: int,
-    test_candidates: int,
-    target_train_pairs: int,
-    target_val_pairs: int,
-    target_test_pairs: int,
+    robustness_sources: int,
     batch_size: int,
     strength: float,
     min_source_tokens: int,
     max_source_tokens: int,
     main_data_seed: int,
+    source_pool_multiplier: int,
     rebuild_partition: bool,
+    run_stage: str,
 ) -> None:
     if workers < 1:
-        raise ValueError("workers must be >=1")
+        raise ValueError("workers must be >= 1")
     if batch_size < 1:
-        raise ValueError("batch_size must be >=1")
-    if train_candidates + val_candidates + test_candidates != source_candidates:
-        raise ValueError("candidate split counts must sum to source_candidates")
+        raise ValueError("batch_size must be >= 1")
+    if source_candidates < 1:
+        raise ValueError("source_candidates must be >= 1")
+    if not 0 <= robustness_sources <= source_candidates:
+        raise ValueError("robustness_sources must be in [0, source_candidates]")
 
     outdir = Path(output)
     outdir.mkdir(parents=True, exist_ok=True)
     raw_dir = outdir / "raw_batches"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # If the frozen partition already exists, reuse the exact model/dataset revisions
-    # recorded when it was created rather than silently following future HF main branches.
     existing_partition = None if rebuild_partition else fetch_partition.remote(PARTITION_TAG, "")
     stored_spec = existing_partition.get("partition_spec") if existing_partition else None
 
+    print(f"Using Modal secret `{HF_SECRET_NAME}` for Hugging Face access.", flush=True)
     print("Resolving immutable Hugging Face revisions and warming the Modal cache...", flush=True)
-    warm_fn = _with_secret(warm_hf_cache, hf_secret)
-    resolved = warm_fn.remote(
+    resolved = warm_hf_cache.remote(
         str(stored_spec.get("model_revision", "")) if stored_spec else "",
         str(stored_spec.get("dataset_revision", "")) if stored_spec else "",
     )
@@ -652,20 +696,18 @@ def _run(
     expected_spec_hash = _spec_hash(spec)
     if existing_partition and existing_partition["partition_spec"].get("spec_hash") != expected_spec_hash:
         raise RuntimeError(
-            "Cached partition spec differs from the code's frozen spec. Use a new PARTITION_TAG if you intentionally change methodology."
+            "Cached partition settings differ from this code's partition settings. "
+            "Use a new PARTITION_TAG or --rebuild-partition only if you intentionally want a new feature."
         )
 
-    source_fn = _with_secret(prepare_sources, hf_secret)
-    prepared = source_fn.remote(
+    prepared = prepare_sources.remote(
         model_revision,
         dataset_revision,
         source_candidates,
-        train_candidates,
-        val_candidates,
-        test_candidates,
         main_data_seed,
         min_source_tokens,
         max_source_tokens,
+        source_pool_multiplier,
     )
     main_sources = prepared["main_sources"]
     _write_jsonl(outdir / "sources.jsonl", main_sources)
@@ -675,48 +717,41 @@ def _run(
 
     partition_payload = existing_partition
     if partition_payload is None:
-        print("Frozen partition not cached (or rebuild requested); generating 256 calibration + 64 control rewrites in parallel...", flush=True)
-        plain_cfg = spec
+        print("Partition not cached (or rebuild requested); generating 256 calibration + 64 control rewrites...", flush=True)
         cal_tasks = _batch_tasks(
-            prepared["calibration_sources"], 4,
-            seed_base=2025 + 10_000,
-            kind="calibration",
-            cfg=plain_cfg,
+            prepared["calibration_sources"], 4, seed_base=2025 + 10_000, kind="calibration", cfg=spec
         )
         ctl_tasks = _batch_tasks(
-            prepared["heldout_control_sources"], 4,
-            seed_base=2025 + 20_000,
-            kind="heldout_control",
-            cfg=plain_cfg,
+            prepared["heldout_control_sources"], 4, seed_base=2025 + 20_000, kind="heldout_control", cfg=spec
         )
-        PlainVariant = _with_secret(
-            PlainWorker,
-            hf_secret,
-            gpu=gpu,
-            max_containers=workers,
-            scaledown_window=300,
-        )
+        PlainVariant = _with_options(PlainWorker, gpu=gpu, max_containers=workers, scaledown_window=300)
         plain_worker = PlainVariant(model_revision=model_revision)
         cal_items = _collect_plain(plain_worker, cal_tasks)
         ctl_items = _collect_plain(plain_worker, ctl_tasks)
 
-        BuilderVariant = _with_secret(PartitionBuilder, hf_secret, gpu=gpu, max_containers=1)
+        BuilderVariant = _with_options(PartitionBuilder, gpu=gpu, max_containers=1)
         builder = BuilderVariant(model_revision=model_revision)
         partition_payload = builder.build.remote(PARTITION_TAG, spec, cal_items, ctl_items)
         print("Partition built and baseline validation passed.", flush=True)
     else:
-        print(f"Reusing frozen partition {PARTITION_TAG} from Modal Volume.", flush=True)
+        print(f"Reusing validated partition {PARTITION_TAG} from Modal Volume.", flush=True)
 
     _save_partition_local(outdir, partition_payload)
+    partition_sha256 = str(partition_payload.get("partition_sha256") or hashlib.sha256(partition_payload["partition_npz"]).hexdigest())
+    actual_partition_spec_hash = str(partition_payload["partition_spec"].get("spec_hash", expected_spec_hash))
 
     config = {
-        "dataset_format_version": "modal-final-v1",
+        "dataset_format_version": "modal-watermark-bank-v2",
+        "run_stage": run_stage,
+        "frozen": False,
         "model": MODEL_ID,
         "model_revision": model_revision,
+        "tokenizer_revision": model_revision,
         "dataset": DATASET_ID,
         "dataset_revision": dataset_revision,
         "partition_tag": PARTITION_TAG,
-        "partition_spec_hash": expected_spec_hash,
+        "partition_spec_hash": actual_partition_spec_hash,
+        "partition_sha256": partition_sha256,
         "strength": strength,
         "temperature": 0.9,
         "symmetric": True,
@@ -726,12 +761,8 @@ def _run(
         "main_data_seed": main_data_seed,
         "selection_seed": main_data_seed + 999,
         "source_candidates": source_candidates,
-        "train_candidates": train_candidates,
-        "val_candidates": val_candidates,
-        "test_candidates": test_candidates,
-        "target_train_pairs": target_train_pairs,
-        "target_val_pairs": target_val_pairs,
-        "target_test_pairs": target_test_pairs,
+        "robustness_sources": robustness_sources,
+        "source_pool_multiplier": source_pool_multiplier,
         "min_source_tokens": min_source_tokens,
         "max_source_tokens": max_source_tokens,
         "batch_size": batch_size,
@@ -745,16 +776,20 @@ def _run(
         "max_adjacent_repeat_fraction": 0.10,
         "require_number_preservation": True,
         "require_backtick_preservation": True,
+        "min_pairs_for_symmetry_gate": 64,
         "gpu": gpu,
         "max_gpu_containers": workers,
+        "fold_definition": "sha256(source_id) mod 10",
+        "default_split_definition": "folds 0-7 train, fold 8 val, fold 9 test",
+        "default_split_counts": prepared["default_split_counts"],
     }
 
-    tasks = _main_tasks(main_sources, batch_size, config)
+    tasks = _main_tasks(main_sources, robustness_sources, batch_size, config)
     config["expected_batches"] = len(tasks)
     generation_identity_keys = [
-        "model", "model_revision", "dataset", "dataset_revision", "partition_tag", "partition_spec_hash",
+        "model", "model_revision", "dataset", "dataset_revision", "partition_tag", "partition_spec_hash", "partition_sha256",
         "strength", "temperature", "symmetric", "sampling_truncation", "entropy_gate", "top_k_gate",
-        "main_data_seed", "source_candidates", "train_candidates", "val_candidates", "test_candidates",
+        "main_data_seed", "source_candidates", "robustness_sources", "source_pool_multiplier",
         "min_source_tokens", "max_source_tokens", "batch_size", "rewrite_max_ratio", "rewrite_extra_tokens",
         "max_new_tokens_cap",
     ]
@@ -777,15 +812,15 @@ def _run(
     }
     pending = [t for t in tasks if int(t["batch_id"]) not in completed]
     print(
-        f"Main generation: {source_candidates} sources × (control + purple + orange), "
-        f"{len(tasks)} batches; {len(completed)} already complete, {len(pending)} pending.",
+        f"Generation: {source_candidates} canonical sources × (control + purple + orange)"
+        f" + {robustness_sources} independent-seed repeats; {len(tasks)} batches; "
+        f"{len(completed)} complete, {len(pending)} pending.",
         flush=True,
     )
 
     if pending:
-        WorkerVariant = _with_secret(
+        WorkerVariant = _with_options(
             WatermarkWorker,
-            hf_secret,
             gpu=gpu,
             max_containers=workers,
             scaledown_window=300,
@@ -803,93 +838,128 @@ def _run(
             tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, final)
             done_now += 1
-            print(f"main batches completed this run: {done_now}/{len(pending)} (overall {len(completed)+done_now}/{len(tasks)})", flush=True)
+            print(
+                f"batches completed this run: {done_now}/{len(pending)} "
+                f"(overall {len(completed)+done_now}/{len(tasks)})",
+                flush=True,
+            )
         if errors:
-            print("Some Modal inputs failed. Successful batches were saved and a rerun will resume them.", flush=True)
+            print("Some Modal inputs failed. Successful batches were saved; rerun the same command to resume.", flush=True)
             for err in errors[:20]:
                 print("  " + err, flush=True)
             raise RuntimeError(f"{len(errors)} generation batches failed; rerun the same command to resume")
 
-    from wmsteg.final_dataset import assemble_dataset
+    from wmsteg.bank_dataset import assemble_bank
 
-    print("Assembling strong/clean train/val/test sets and long-all evaluation sets...", flush=True)
-    summary = assemble_dataset(outdir, config)
-    print((outdir / "data_summary.md").read_text(encoding="utf-8"), flush=True)
-    if not all(summary["targets_met"].values()):
-        print(
-            "WARNING: one or more requested final pair counts were not reached. "
-            "All generated data is preserved; increase candidate counts and run a new output directory if needed.",
-            flush=True,
-        )
-    print(f"Done. Dataset written locally to: {outdir.resolve()}", flush=True)
+    print("Assembling reusable fold-assigned research bank...", flush=True)
+    summary = assemble_bank(outdir, config)
+    print((outdir / "bank_summary.md").read_text(encoding="utf-8"), flush=True)
+    if not summary["validation"]["pass"]:
+        print("WARNING: one or more PoC validation gates failed. Do not scale yet; inspect outputs first.", flush=True)
+    print(f"Done. Research bank written locally to: {outdir.resolve()}", flush=True)
 
 
 @app.local_entrypoint()
 def main(
-    output: str = "runs/lyra_watermark_final_v1",
-    workers: int = 8,
+    output: str = "runs/lyra_watermark_poc_v2",
+    workers: int = 4,
     gpu: str = "A10",
-    hf_secret: str = "",
-    source_candidates: int = 1500,
-    train_candidates: int = 1200,
-    val_candidates: int = 150,
-    test_candidates: int = 150,
-    target_train_pairs: int = 800,
-    target_val_pairs: int = 100,
-    target_test_pairs: int = 100,
+    source_candidates: int = 128,
+    robustness_sources: int = 16,
     batch_size: int = 4,
     strength: float = 5.0,
     min_source_tokens: int = 96,
     max_source_tokens: int = 320,
-    main_data_seed: int = 4040,
+    main_data_seed: int = 6060,
+    source_pool_multiplier: int = 3,
     rebuild_partition: bool = False,
+    run_stage: str = "poc",
 ) -> None:
-    """Generate the final long-form Lyra watermark corpus across multiple Modal GPUs."""
+    """Generic bank generation entrypoint. Defaults are intentionally small."""
     _run(
         output=output,
         workers=workers,
         gpu=gpu,
-        hf_secret=hf_secret,
         source_candidates=source_candidates,
-        train_candidates=train_candidates,
-        val_candidates=val_candidates,
-        test_candidates=test_candidates,
-        target_train_pairs=target_train_pairs,
-        target_val_pairs=target_val_pairs,
-        target_test_pairs=target_test_pairs,
+        robustness_sources=robustness_sources,
         batch_size=batch_size,
         strength=strength,
         min_source_tokens=min_source_tokens,
         max_source_tokens=max_source_tokens,
         main_data_seed=main_data_seed,
+        source_pool_multiplier=source_pool_multiplier,
         rebuild_partition=rebuild_partition,
+        run_stage=run_stage,
     )
 
 
 @app.local_entrypoint()
 def smoke(
-    output: str = "runs/modal_smoke",
+    output: str = "runs/modal_smoke_v2",
     workers: int = 2,
     gpu: str = "A10",
-    hf_secret: str = "",
 ) -> None:
-    """Small end-to-end check. Reuses the same frozen partition if it already exists."""
+    """Tiny integration run; not intended to validate aggregate statistics."""
     _run(
         output=output,
         workers=workers,
         gpu=gpu,
-        hf_secret=hf_secret,
         source_candidates=24,
-        train_candidates=16,
-        val_candidates=4,
-        test_candidates=4,
-        target_train_pairs=1,
-        target_val_pairs=1,
-        target_test_pairs=1,
+        robustness_sources=4,
         batch_size=4,
         strength=5.0,
         min_source_tokens=96,
         max_source_tokens=320,
         main_data_seed=5050,
+        source_pool_multiplier=2,
         rebuild_partition=False,
+        run_stage="smoke",
+    )
+
+
+@app.local_entrypoint()
+def poc(
+    output: str = "runs/lyra_watermark_poc_128",
+    workers: int = 4,
+    gpu: str = "A10",
+) -> None:
+    """First real proof-of-concept: enough data to inspect folds, retention, and seed robustness."""
+    _run(
+        output=output,
+        workers=workers,
+        gpu=gpu,
+        source_candidates=128,
+        robustness_sources=16,
+        batch_size=4,
+        strength=5.0,
+        min_source_tokens=96,
+        max_source_tokens=320,
+        main_data_seed=6060,
+        source_pool_multiplier=3,
+        rebuild_partition=False,
+        run_stage="poc-128",
+    )
+
+
+@app.local_entrypoint()
+def pilot(
+    output: str = "runs/lyra_watermark_pilot_512",
+    workers: int = 8,
+    gpu: str = "A10",
+) -> None:
+    """Second-stage pilot. Run only after the 128-source PoC looks good."""
+    _run(
+        output=output,
+        workers=workers,
+        gpu=gpu,
+        source_candidates=512,
+        robustness_sources=64,
+        batch_size=4,
+        strength=5.0,
+        min_source_tokens=96,
+        max_source_tokens=320,
+        main_data_seed=7070,
+        source_pool_multiplier=3,
+        rebuild_partition=False,
+        run_stage="pilot-512",
     )

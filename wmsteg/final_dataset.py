@@ -120,8 +120,8 @@ def informational_quality_flags(source: str, row: dict) -> list[str]:
 
 
 def roc_auc(rows: Sequence[dict]) -> float:
-    p = [float(r["purple_fraction_colored"]) for r in rows if int(r.get("label", -1)) == PURPLE]
-    o = [float(r["purple_fraction_colored"]) for r in rows if int(r.get("label", -1)) == ORANGE]
+    p = [float(r["purple_fraction_colored"]) for r in rows if r.get("label") == PURPLE]
+    o = [float(r["purple_fraction_colored"]) for r in rows if r.get("label") == ORANGE]
     if not p or not o:
         return float("nan")
     wins = 0.0
