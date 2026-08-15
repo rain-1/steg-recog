@@ -4,4 +4,5 @@ tokenizers>=0.22
 accelerate>=1.10
 safetensors>=0.6
 numpy>=2.0
+tqdm>=4.66
 pytest>=8.0

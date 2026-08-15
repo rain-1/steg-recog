@@ -171,3 +171,88 @@ Only after that is working is it worth reducing the logit bias, changing passage
 ## Notes on versions
 
 Qwen3 requires a Transformers release new enough to contain the Qwen3 architecture. This project targets the current Transformers 5.x API and pins a narrow 5.x range in `pyproject.toml`/`requirements.txt` for sprint reproducibility.
+
+---
+
+## Follow-up after the initial mean-pool result
+
+If your first run found that the **final-layer mean-pooled** frozen and joint detectors remain near chance, do **not** regenerate the dataset yet. Run:
+
+```bash
+./run_followup.sh
+```
+
+This script reuses `runs/exp0_data` and performs three diagnostics/interventions.
+
+### 1. Layer-by-layer frozen probes
+
+`scripts/probe_layers.py` caches mean-pooled representations from:
+
+- the raw input embeddings;
+- several early/middle/late transformer layers selected automatically;
+- the final transformer layer.
+
+It then trains a separate linear probe on each cached representation while the LLM remains completely frozen. The output is:
+
+```text
+runs/exp0_layer_probes/layer_probe_metrics.json
+```
+
+The embedding probe is an especially useful sanity check because the purple/orange token partition was itself constructed from a random hyperplane in the model's input-embedding space.
+
+You can choose explicit layers, e.g.:
+
+```bash
+python scripts/probe_layers.py \
+  --data runs/exp0_data \
+  --layers embeddings,1,4,8,12,final
+```
+
+### 2. Designated suffix readout
+
+Instead of averaging the final residual stream, the suffix detector presents each example as:
+
+```text
+[watermarked carrier passage]
+
+Watermark:
+```
+
+The fixed suffix is guaranteed to survive truncation. The linear classifier reads the hidden state of the final non-padding token (the last token of `Watermark:`). The suffix is identical for both classes and contains no class label.
+
+Frozen baseline:
+
+```bash
+python scripts/train_detector.py \
+  --data runs/exp0_data \
+  --output runs/exp0_suffix_frozen \
+  --mode frozen \
+  --readout suffix \
+  --epochs 10 \
+  --batch-size 16
+```
+
+### 3. Joint suffix-token training
+
+The intervention condition allows classification gradients to update the whole transformer and gives the model a designated position at which to aggregate watermark evidence:
+
+```bash
+python scripts/train_detector.py \
+  --data runs/exp0_data \
+  --output runs/exp0_suffix_joint \
+  --mode joint \
+  --readout suffix \
+  --epochs 5 \
+  --batch-size 4 \
+  --grad-accum 4 \
+  --lr-backbone 5e-5 \
+  --lr-head 1e-3
+```
+
+As before, the modified ordinary causal-LM weights are saved to:
+
+```text
+runs/exp0_suffix_joint/backbone_final/
+```
+
+and the auxiliary linear head is saved separately as `head.pt`.

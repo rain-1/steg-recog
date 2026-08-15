@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 
 import numpy as np
@@ -14,16 +13,19 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm.auto import tqdm
 
-from wmsteg.data import JsonlWatermarkDataset, make_collator
-from wmsteg.modeling import MeanPoolDetector
+from wmsteg.data import JsonlWatermarkDataset, make_collator, make_suffix_collator
+from wmsteg.modeling import LinearWatermarkDetector
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train a linear mean-pool watermark detector.")
+    p = argparse.ArgumentParser(description="Train a linear watermark detector on a chosen backbone readout.")
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
     p.add_argument("--data", default="runs/exp0_data")
     p.add_argument("--output", default="runs/exp0_joint")
     p.add_argument("--mode", choices=["frozen", "joint"], default="joint")
+    p.add_argument("--readout", choices=["mean", "suffix"], default="mean",
+                   help="mean = mean-pool final residuals; suffix = append a fixed suffix and classify its last token")
+    p.add_argument("--suffix", default="\n\nWatermark:")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--grad-accum", type=int, default=4)
@@ -125,7 +127,11 @@ def main():
         lm.gradient_checkpointing_enable()
 
     hidden_size = config_hidden_size(lm.config)
-    detector = MeanPoolDetector(lm, hidden_size).to(device)
+    detector = LinearWatermarkDetector(
+        lm,
+        hidden_size,
+        readout="last" if args.readout == "suffix" else "mean",
+    ).to(device)
 
     if args.mode == "frozen":
         for p in detector.causal_lm.parameters():
@@ -134,7 +140,13 @@ def main():
     train_ds = JsonlWatermarkDataset(datadir / "train.jsonl")
     val_ds = JsonlWatermarkDataset(datadir / "val.jsonl")
     test_ds = JsonlWatermarkDataset(datadir / "test.jsonl")
-    collate = make_collator(tokenizer, args.max_length)
+    if args.readout == "suffix":
+        collate = make_suffix_collator(tokenizer, args.max_length, args.suffix)
+        print(f"Readout: final non-padding token after suffix {args.suffix!r}", flush=True)
+    else:
+        collate = make_collator(tokenizer, args.max_length)
+        print("Readout: mean-pooled final residual stream", flush=True)
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
         num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
@@ -167,14 +179,13 @@ def main():
     for epoch in range(args.epochs):
         detector.train()
         if args.mode == "frozen":
-            # Keep the frozen representation deterministic; only the linear head trains.
             detector.causal_lm.eval()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
         seen = 0
         train_bar = tqdm(
             train_loader,
-            desc=f"{args.mode} epoch {epoch + 1}/{args.epochs}",
+            desc=f"{args.mode}/{args.readout} epoch {epoch + 1}/{args.epochs}",
             unit="batch",
             dynamic_ncols=True,
         )
@@ -207,20 +218,19 @@ def main():
             avg_loss = running_loss / max(1, seen)
             train_bar.set_postfix(
                 loss=f"{avg_loss:.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                head_lr=f"{optimizer.param_groups[0]['lr']:.2e}",
                 updates=global_update,
             )
 
         val_metrics = evaluate(
-            detector, val_loader, device, autocast_dtype, desc=f"{args.mode} val {epoch + 1}/{args.epochs}"
+            detector, val_loader, device, autocast_dtype,
+            desc=f"{args.mode}/{args.readout} val {epoch + 1}/{args.epochs}"
         )
         train_loss = running_loss / max(1, seen)
         record = {"epoch": epoch + 1, "train_loss": train_loss, "val": val_metrics}
         history.append(record)
         print(json.dumps(record, indent=2))
 
-    # Save the final intervention checkpoint. Keeping head and backbone from the same
-    # training step makes the reported test metrics exactly reproducible.
     torch.save(detector.classifier.state_dict(), outdir / "head.pt")
     if args.mode == "joint":
         detector.causal_lm.config.use_cache = True
@@ -228,7 +238,7 @@ def main():
         tokenizer.save_pretrained(outdir / "backbone_final")
         detector.causal_lm.config.use_cache = False
 
-    final_test = evaluate(detector, test_loader, device, autocast_dtype, desc=f"{args.mode} test")
+    final_test = evaluate(detector, test_loader, device, autocast_dtype, desc=f"{args.mode}/{args.readout} test")
     metrics = {"args": vars(args), "history": history, "test": final_test}
     with open(outdir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, sort_keys=True)

@@ -1,8 +1,7 @@
-import numpy as np
 import torch
 
-from wmsteg.pooling import masked_mean_pool
-from wmsteg.watermark import PURPLE, ORANGE, ColorBiasLogitsProcessor, build_hyperplane_partition
+from wmsteg.pooling import last_nonpad_pool, masked_mean_pool
+from wmsteg.watermark import PURPLE, ColorBiasLogitsProcessor, build_hyperplane_partition
 
 
 def test_mean_pool_masks_padding():
@@ -10,6 +9,16 @@ def test_mean_pool_masks_padding():
     mask = torch.tensor([[1, 1, 0]])
     got = masked_mean_pool(h, mask)
     assert torch.allclose(got, torch.tensor([[2., 3.]]))
+
+
+def test_last_nonpad_pool():
+    h = torch.tensor([
+        [[1., 1.], [2., 2.], [99., 99.]],
+        [[3., 3.], [4., 4.], [5., 5.]],
+    ])
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    got = last_nonpad_pool(h, mask)
+    assert torch.allclose(got, torch.tensor([[2., 2.], [5., 5.]]))
 
 
 def test_partition_balanced_and_neutral():
