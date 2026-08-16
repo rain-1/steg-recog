@@ -1,0 +1,10 @@
+torch>=2.7,<3
+transformers>=5.14.0,<5.16
+tokenizers>=0.22
+accelerate>=1.10
+safetensors>=0.6
+numpy>=2.0
+huggingface_hub>=0.34
+peft>=0.17
+wandb>=0.22.3,<0.24
+pytest>=8

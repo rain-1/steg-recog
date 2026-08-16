@@ -395,3 +395,75 @@ The important interpretation is:
 1. WM-recognition learns purple/orange behavioral routing faster than base → recognition transfers into behavior.
 2. Detector accuracy collapses during behavioral SFT → catastrophic forgetting explains loss of transfer.
 3. Detector accuracy remains high but there is no behavioral advantage → the learned recognition representation exists but is not being recruited by the normal generative pathway.
+
+## Local generative watermark verbalization sanity check (v2.9)
+
+This experiment asks whether the jointly trained watermark-recognition backbone can be cheaply recruited into the normal LM output pathway.
+
+For every source, the same semantics occur in both colors:
+
+- purple prompt -> target assistant text `PURPLE`
+- orange prompt -> target assistant text `ORANGE`
+
+Two input contexts are compared:
+
+- `normal`: ordinary watermarked user prompt
+- `suffix`: the same prompt with `\n\nWatermark:` appended before the assistant turn
+
+The key result is sample efficiency: does the WM-recognition start learn the generative label with fewer sources than original Qwen? A large advantage only for `suffix` suggests the installed readout is context-specific; an advantage for `normal` shows it is accessible from the ordinary assistant boundary.
+
+### One-time local setup
+
+The jointly trained detector backbone lives in the Modal detector volume. Download only the best detector checkpoint:
+
+```bash
+modal volume get wmsteg-detector-runs detector_poc_128_v2/joint_best runs/detector_poc_128_v2/remote/joint_best
+```
+
+Install local GPU dependencies:
+
+```bash
+pip install -r requirements-local-gpu.txt
+```
+
+If Hugging Face requires authentication, your normal local `HF_TOKEN` environment variable is sufficient.
+
+### Overnight 4080 run
+
+```bash
+./run_verbalization_local.sh
+```
+
+Defaults are deliberately sized for a single consumer GPU:
+
+- train sizes: 8, 32, 64 sources (each contributes purple + orange)
+- two paired optimization seeds: 4242, 5252
+- two contexts: normal, suffix
+- two starts: base, WM-recognition
+- 24 sequential LoRA runs total
+- 5 epochs each
+- BF16 when supported
+
+The run is resumable at the individual-run level. Re-running the same command skips completed runs.
+
+For a shorter first pass:
+
+```bash
+SIZES=8,32 SEEDS=4242 EPOCHS=4 ./run_verbalization_local.sh
+```
+
+Outputs:
+
+```text
+runs/verbalization_local/
+  summary.md
+  aggregate.json
+  config.json
+  dataset.json
+  runs/
+    base_normal_n8_seed4242/
+    wm_recognition_normal_n8_seed4242/
+    ...
+```
+
+The primary metrics are held-out label-preference accuracy/AUC and final greedy verbalization accuracy.
