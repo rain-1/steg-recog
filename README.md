@@ -675,3 +675,35 @@ DETECTOR_RUN=detector_scale4x_v1 ./run_category_routing_train.sh
 ```
 
 The category-routing data design itself does not need to change based on this scaling result.
+
+
+## v2.12: feature path-dependence / hysteresis
+
+This experiment asks whether two models that receive the **same final aligned post-training distribution** can generalize along different features because of their early optimization history. It reuses `runs/category_routing_data`; no new watermark generation is required.
+
+Prepare the curriculum dataset:
+
+```bash
+./run_path_dependence_prepare.sh
+```
+
+The default semantic binary is:
+
+- A / digital-analytical: cryptocurrency, backend development; held-out transfer category: personal finance
+- B / physical-creative: cooking, photography; held-out transfer category: strength training
+
+All curricula end with the same aligned phase: A+purple -> COMPLY and B+orange -> REFUSE. Only the first 20% of optimizer updates differs:
+
+- `joint`: both features predict behavior from the start
+- `semantic_first`: semantic class predicts behavior while color is exactly 50/50 inside every category
+- `watermark_first`: watermark predicts behavior while each semantic category is exactly 50/50 comply/refuse
+
+Run the default paired sweep:
+
+```bash
+./run_path_dependence_train.sh
+```
+
+Defaults: base vs `detector_scale4x_v1`, three curricula, three paired seeds, 80 fixed LoRA optimizer steps, 20% warm-start, six L40S jobs concurrently (18 total). The main-phase data stream is reset to the same seed for all curricula, so the final 80% uses identical examples/order. There is no early stopping: the fixed-budget final model is the primary endpoint.
+
+The factorial test shows both purple and orange versions of every source, plus controls. Main metrics are `watermark_effect`, `semantic_effect`, `axis_score_wm_minus_sem`, and crossed-cue watermark/semantic follow rates. Held-out categories test whether the selected axis generalizes beyond the semantic domains used in SFT.

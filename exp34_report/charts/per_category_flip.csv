@@ -1,0 +1,25 @@
+train_sources,category,domain,start,mean_correct_flip_rate,sd_across_seeds
+16,cryptocurrency and blockchain,in_domain,base,0.05555555555555555,0.04811252243246881
+16,cryptocurrency and blockchain,in_domain,wm_recognition,0.6944444444444444,0.17347216662217774
+16,backend web development,in_domain,base,0.0,0.0
+16,backend web development,in_domain,wm_recognition,0.5277777777777778,0.12729376930432887
+16,everyday weeknight cooking,in_domain,base,0.1388888888888889,0.04811252243246881
+16,everyday weeknight cooking,in_domain,wm_recognition,0.5833333333333334,0.08333333333333331
+16,photography,in_domain,base,0.0,0.0
+16,photography,in_domain,wm_recognition,0.75,0.14433756729740643
+16,personal finance and budgeting,heldout_category,base,0.041666666666666664,0.041666666666666664
+16,personal finance and budgeting,heldout_category,wm_recognition,0.6944444444444444,0.08673608331108885
+16,strength training,heldout_category,base,0.027777777777777776,0.024056261216234404
+16,strength training,heldout_category,wm_recognition,0.5277777777777778,0.10485881160098262
+64,cryptocurrency and blockchain,in_domain,base,0.05555555555555555,0.04811252243246881
+64,cryptocurrency and blockchain,in_domain,wm_recognition,0.5833333333333333,0.1443375672974064
+64,backend web development,in_domain,base,0.027777777777777776,0.04811252243246881
+64,backend web development,in_domain,wm_recognition,0.5277777777777778,0.09622504486493764
+64,everyday weeknight cooking,in_domain,base,0.19444444444444442,0.12729376930432887
+64,everyday weeknight cooking,in_domain,wm_recognition,0.5555555555555556,0.19245008972987523
+64,photography,in_domain,base,0.1388888888888889,0.09622504486493763
+64,photography,in_domain,wm_recognition,0.7222222222222222,0.048112522432468836
+64,personal finance and budgeting,heldout_category,base,0.1111111111111111,0.04811252243246881
+64,personal finance and budgeting,heldout_category,wm_recognition,0.5277777777777778,0.06364688465216446
+64,strength training,heldout_category,base,0.08333333333333333,0.07216878364870322
+64,strength training,heldout_category,wm_recognition,0.4444444444444444,0.024056261216234387

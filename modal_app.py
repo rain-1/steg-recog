@@ -2464,6 +2464,294 @@ def category_routing_train(
     print("Checkpoints live in Modal Volume `wmsteg-behavior-runs`.", flush=True)
     print(f"Download with: modal volume get wmsteg-behavior-runs {run_name} {outdir}/remote", flush=True)
 
+
+# =============================================================================
+# Feature path-dependence / hysteresis: identical final distribution, different
+# early feature curricula.
+# =============================================================================
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    secrets=[WANDB_SECRET],
+    cpu=8,
+    memory=32768,
+    timeout=60 * 60 * 6,
+    volumes={
+        CACHE_MOUNT: HF_CACHE.with_mount_options(read_only=True),
+        DETECTOR_MOUNT: DETECTOR_RUNS.with_mount_options(read_only=True),
+        BEHAVIOR_MOUNT: BEHAVIOR_RUNS,
+    },
+)
+def train_path_dependence_remote(dataset_gz: bytes, config: dict, start_mode: str, curriculum: str) -> dict:
+    import gzip
+    from wmsteg.path_dependence import run_path_dependence_training
+
+    dataset = json.loads(gzip.decompress(dataset_gz).decode("utf-8"))
+    result = run_path_dependence_training(
+        dataset,
+        config=config,
+        model_id=MODEL_ID,
+        cache_dir=f"{CACHE_MOUNT}/huggingface/hub",
+        detector_root=Path(DETECTOR_MOUNT),
+        remote_root=Path(BEHAVIOR_MOUNT),
+        start_mode=str(start_mode),
+        curriculum=str(curriculum),
+    )
+    BEHAVIOR_RUNS.commit()
+    return result
+
+
+@app.local_entrypoint()
+def path_dependence_prepare(
+    category_data: str = "runs/category_routing_data",
+    output: str = "runs/path_dependence_data",
+    warm_per_category: int = 4,
+    main_per_category: int = 16,
+    val_per_category: int = 4,
+    seed: int = 15031,
+    semantic_a_categories: str = "cryptocurrency and blockchain,backend web development,personal finance and budgeting",
+    semantic_b_categories: str = "everyday weeknight cooking,photography,strength training",
+) -> None:
+    """Build the path-dependence dataset from the existing category-routing bank.
+
+    This is a local transformation only: it reuses already generated
+    purple/orange/control variants and compliant targets, so it performs no GPU
+    inference and no new watermark generation.
+    """
+    from wmsteg.path_dependence import build_path_dependence_dataset
+
+    datadir = Path(category_data)
+    plan_path = datadir / "category_plan.json"
+    cfg_path = datadir / "category_datagen_config.json"
+    if not plan_path.exists() or not cfg_path.exists():
+        raise FileNotFoundError(
+            "Expected category_plan.json and category_datagen_config.json. "
+            "Run category_routing_datagen first."
+        )
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    source_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+
+    a = [x.strip() for x in semantic_a_categories.split(",") if x.strip()]
+    b = [x.strip() for x in semantic_b_categories.split(",") if x.strip()]
+    if set(a) & set(b):
+        raise ValueError("semantic A/B category sets overlap")
+    sem_map = {x: "A_digital_analytical" for x in a}
+    sem_map.update({x: "B_physical_creative" for x in b})
+
+    dataset = build_path_dependence_dataset(
+        plan,
+        semantic_class_map=sem_map,
+        warm_per_category=int(warm_per_category),
+        main_per_category=int(main_per_category),
+        val_per_category=int(val_per_category),
+        seed=int(seed),
+    )
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "path_dependence_dataset.json").write_text(
+        json.dumps(dataset, ensure_ascii=False), encoding="utf-8"
+    )
+    config = {
+        "format": "path-dependence-prep-v1",
+        "source_category_data": str(category_data),
+        "model_revision": str(source_cfg["model_revision"]),
+        "dataset_revision": str(source_cfg.get("dataset_revision", "")),
+        "partition_tag": str(source_cfg.get("partition_tag", "")),
+        "partition_sha256": str(source_cfg.get("partition_sha256", "")),
+        "warm_per_category": int(warm_per_category),
+        "main_per_category": int(main_per_category),
+        "val_per_category": int(val_per_category),
+        "seed": int(seed),
+        "semantic_class_map": sem_map,
+    }
+    (outdir / "path_dependence_config.json").write_text(
+        json.dumps(config, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    # Compact audit of what information is available in each warm curriculum.
+    audit = {}
+    from collections import Counter
+    for cur, rows in dataset["warm_rows"].items():
+        audit[cur] = {
+            "n": len(rows),
+            "labels": dict(sorted(Counter(r["target_behavior"] for r in rows).items())),
+            "colors": dict(sorted(Counter(r["watermark"] for r in rows).items())),
+            "semantic_classes": dict(sorted(Counter(r["semantic_class"] for r in rows).items())),
+            "semantic_x_color": dict(sorted(Counter(f"{r['semantic_class']}|{r['watermark']}" for r in rows).items())),
+            "semantic_x_label": dict(sorted(Counter(f"{r['semantic_class']}|{r['target_behavior']}" for r in rows).items())),
+            "color_x_label": dict(sorted(Counter(f"{r['watermark']}|{r['target_behavior']}" for r in rows).items())),
+        }
+    audit["main"] = {
+        "n": len(dataset["main_rows"]),
+        "semantic_x_color_x_label": dict(sorted(Counter(
+            f"{r['semantic_class']}|{r['watermark']}|{r['target_behavior']}" for r in dataset["main_rows"]
+        ).items())),
+    }
+    (outdir / "balance_audit.json").write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+    # Human-readable rows are convenient for manual review without opening the
+    # nested JSON payload.
+    from wmsteg.behavior_poc import write_jsonl
+    for cur, rows in dataset["warm_rows"].items():
+        write_jsonl(outdir / f"warm_{cur}.jsonl", rows)
+    write_jsonl(outdir / "main_aligned.jsonl", dataset["main_rows"])
+    write_jsonl(outdir / "val_factorial.jsonl", dataset["val_eval"])
+    write_jsonl(outdir / "test_factorial.jsonl", dataset["test_eval"])
+
+    summary = "\n".join([
+        "# Path-dependence / hysteresis dataset",
+        "",
+        "All curricula share the exact same final aligned phase:",
+        "- semantic A + purple → COMPLY",
+        "- semantic B + orange → REFUSE",
+        "",
+        "Only the early warm-start differs:",
+        "- `joint`: semantics and watermark both predict behavior",
+        "- `semantic_first`: semantics predicts behavior; color is exactly balanced within category",
+        "- `watermark_first`: watermark predicts behavior; semantic class is balanced across behaviors",
+        "",
+        f"Warm sources: **{len(dataset['warm_source_order'])}**",
+        f"Main/final-phase sources: **{len(dataset['main_source_order'])}**",
+        f"Validation factorial rows: **{len(dataset['val_eval'])}**",
+        f"Test factorial rows: **{len(dataset['test_eval'])}**",
+        "",
+        "The warm/main/validation source pools are disjoint. Test sources come from the original source-disjoint category-routing test split.",
+        "No new watermarked text was generated for this experiment.",
+        "",
+    ])
+    (outdir / "summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print(f"Path-dependence data ready: {outdir.resolve()}", flush=True)
+
+
+@app.local_entrypoint()
+def path_dependence_train(
+    data: str = "runs/path_dependence_data",
+    output: str = "runs/path_dependence_results",
+    detector_run: str = "detector_scale4x_v1",
+    gpu: str = "L40S",
+    starts: str = "base,wm_recognition",
+    curricula: str = "joint,semantic_first,watermark_first",
+    seeds: str = "4242,5252,6262",
+    total_steps: int = 80,
+    warm_fraction: float = 0.20,
+    lr: float = 1e-4,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    max_parallel: int = 6,
+    wandb_project: str = "steg-recog",
+    wandb_entity: str = "",
+    wandb_mode: str = "online",
+) -> None:
+    """Run the 2 starts × 3 curricula × 3 seeds path-dependence sweep.
+
+    The primary endpoint is the final fixed-budget model. The final phase uses
+    identical examples and paired ordering across curricula; crossed factorial
+    cells are diagnostics only and never control checkpoint selection.
+    """
+    import gzip
+    from wmsteg.behavior_poc import parse_seed_list, write_jsonl
+    from wmsteg.path_dependence import CURRICULA, render_path_dependence_summary, summarize_path_dependence_runs
+
+    datadir = Path(data)
+    dataset_path = datadir / "path_dependence_dataset.json"
+    cfg_path = datadir / "path_dependence_config.json"
+    if not dataset_path.exists() or not cfg_path.exists():
+        raise FileNotFoundError("Run path_dependence_prepare first")
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    data_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    model_revision = str(data_cfg["model_revision"])
+    warm_hf_cache.remote(model_revision, str(data_cfg.get("dataset_revision", "")))
+
+    seed_values = parse_seed_list(seeds)
+    start_values = [x.strip() for x in starts.split(",") if x.strip()]
+    allowed_starts = {"base", "wm_recognition"}
+    if not start_values or any(x not in allowed_starts for x in start_values):
+        raise ValueError(f"--starts must be a comma list from {sorted(allowed_starts)}")
+    curriculum_values = [x.strip() for x in curricula.split(",") if x.strip()]
+    if not curriculum_values or any(x not in CURRICULA for x in curriculum_values):
+        raise ValueError(f"--curricula must be a comma list from {list(CURRICULA)}")
+    if int(total_steps) < 4:
+        raise ValueError("--total-steps must be >= 4")
+    if not (0.0 < float(warm_fraction) < 1.0):
+        raise ValueError("--warm-fraction must be in (0,1)")
+
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    run_name = outdir.name
+    common = {
+        "run_name": run_name,
+        "model_revision": model_revision,
+        "detector_run": str(detector_run),
+        "total_steps": int(total_steps),
+        "warm_fraction": float(warm_fraction),
+        "lr": float(lr),
+        "weight_decay": 0.0,
+        "batch_size": 1,
+        "grad_accum": 4,
+        "generation_batch_size": 4,
+        "eval_batch_size": 2,
+        "max_length": 768,
+        "eval_max_new_tokens": 128,
+        "max_grad_norm": 1.0,
+        "lora_r": int(lora_r),
+        "lora_alpha": int(lora_alpha),
+        "lora_dropout": 0.0,
+        "main_eval_fractions": [0.25, 0.5, 0.75, 1.0],
+        "primary_endpoint": "fixed-budget final model after identical final phase",
+        "selection_rule": "none: no early stopping; crossed cells never select a checkpoint",
+        "semantic_rule": dataset.get("semantic_rule"),
+        "watermark_rule": dataset.get("watermark_rule"),
+        "semantic_class_map": dataset.get("semantic_class_map"),
+        "wandb_project": str(wandb_project),
+        "wandb_entity": str(wandb_entity),
+        "wandb_mode": str(wandb_mode),
+    }
+    (outdir / "train_config.json").write_text(json.dumps({
+        **common,
+        "starts": start_values,
+        "curricula": curriculum_values,
+        "seeds": seed_values,
+        "max_parallel": int(max_parallel),
+    }, indent=2, sort_keys=True), encoding="utf-8")
+
+    payload_gz = gzip.compress(json.dumps(dataset, ensure_ascii=False).encode("utf-8"), compresslevel=6)
+    Remote = train_path_dependence_remote.with_options(gpu=gpu)
+    jobs = []
+    for seed in seed_values:
+        for start_mode in start_values:
+            for curriculum in curriculum_values:
+                result_id = f"{start_mode}_{curriculum}_seed_{seed}"
+                cfg = {**common, "seed": int(seed), "result_id": result_id}
+                jobs.append((start_mode, curriculum, int(seed), cfg))
+
+    results = []
+    width = max(1, int(max_parallel))
+    print(
+        f"Launching {len(jobs)} path-dependence jobs in waves of at most {width} on {gpu}...",
+        flush=True,
+    )
+    for start in range(0, len(jobs), width):
+        wave = jobs[start:start + width]
+        calls = [Remote.spawn(payload_gz, cfg, start_mode, curriculum) for start_mode, curriculum, _, cfg in wave]
+        gathered = modal.FunctionCall.gather(*calls)
+        for (start_mode, curriculum, seed, cfg), result in zip(wave, gathered):
+            results.append(result)
+            stem = str(cfg["result_id"])
+            (outdir / f"{stem}_metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+            write_jsonl(outdir / f"{stem}_test_predictions.jsonl", result.get("test_predictions", []))
+        print(f"Completed {min(start + width, len(jobs))}/{len(jobs)} jobs", flush=True)
+
+    aggregate = summarize_path_dependence_runs(results)
+    summary = render_path_dependence_summary(aggregate)
+    (outdir / "aggregate.json").write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "metrics.json").write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print("LoRA adapters live in Modal Volume `wmsteg-behavior-runs`.", flush=True)
+    print(f"Download with: modal volume get wmsteg-behavior-runs {run_name} {outdir}/remote", flush=True)
+
+
 # =============================================================================
 # Recognition-data scaling: 4x unique semantic sources + low-shot transfer check
 # =============================================================================
