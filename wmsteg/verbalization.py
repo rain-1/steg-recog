@@ -304,7 +304,7 @@ def _load_start(start_mode: str, model_id: str, model_revision: str | None, wm_b
         tok = AutoTokenizer.from_pretrained(model_id, revision=model_revision or None)
         model = AutoModelForCausalLM.from_pretrained(model_id, revision=model_revision or None, dtype=dtype)
         source = f"{model_id}@{model_revision or 'default'}"
-    elif start_mode == "wm_recognition":
+    elif start_mode.startswith("wm"):
         path = Path(wm_backbone)
         if not path.exists():
             raise FileNotFoundError(
@@ -398,7 +398,7 @@ def train_one_verbalizer(
             group=str(cfg.get("wandb_group", "verbalization-local")),
             name=result_id,
             config={**cfg, "start_mode": start_mode, "format": fmt, "train_sources": int(train_sources), "seed": int(seed), "start_source": start_source},
-            reinit=True,
+            reinit="finish_previous",
         )
 
     zero_metrics, zero_preds = score_verbalization(model, tokenizer, test_rows, fmt, cfg, split="test", checkpoint="epoch_0")

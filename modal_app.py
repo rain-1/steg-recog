@@ -40,6 +40,7 @@ REMOTE_PACKAGES = [
     "datasets>=3.0",
     "huggingface_hub>=0.34",
     "wandb>=0.22.3,<0.24",
+    "peft>=0.17,<0.19",
 ]
 
 image = (
@@ -2020,4 +2021,873 @@ def watermark_only_transfer_train(
     (outdir/"summary.md").write_text(summary, encoding="utf-8")
     print(summary, flush=True)
     print("Transfer checkpoints live in Modal Volume `wmsteg-behavior-runs`.", flush=True)
+    print(f"Download with: modal volume get wmsteg-behavior-runs {run_name} {outdir}/remote", flush=True)
+
+
+# =============================================================================
+# Balanced-category watermark routing experiment
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[HF_SECRET],
+    volumes={CACHE_MOUNT: HF_CACHE},
+    cpu=4,
+    memory=16384,
+    timeout=60 * 45,
+)
+def prepare_category_routing_sources(
+    model_revision: str,
+    dataset_revision: str,
+    excluded_source_ids: list[str],
+    topic_quotas: dict[str, int],
+    seed: int,
+    min_source_tokens: int,
+    max_source_tokens: int,
+) -> dict:
+    """Load exact benign Lyra topic quotas for the balanced-routing experiment."""
+    from transformers import AutoTokenizer
+    from wmsteg.lyra import load_topic_source_rows
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID, revision=model_revision, local_files_only=True)
+    rows = load_topic_source_rows(
+        tok,
+        topics=list(topic_quotas),
+        n_per_topic={str(k): int(v) for k, v in topic_quotas.items()},
+        seed=int(seed),
+        dataset_name=DATASET_ID,
+        dataset_split=DATASET_SPLIT,
+        dataset_revision=dataset_revision,
+        language="english",
+        min_source_tokens=int(min_source_tokens),
+        max_source_tokens=int(max_source_tokens),
+        excluded_source_ids=set(str(x) for x in excluded_source_ids),
+        shuffle_buffer=50_000,
+    )
+    out = []
+    for gid, r in enumerate(rows):
+        rr = dict(r)
+        rr["global_pair_id"] = gid
+        rr["split_pair_id"] = gid
+        rr["default_split"] = "category_candidate"
+        rr["split"] = "category_candidate"
+        rr["fold"] = -1
+        rr["source_dataset"] = DATASET_ID
+        rr["source_dataset_revision"] = dataset_revision
+        out.append(rr)
+    counts = {}
+    for r in out:
+        counts[str(r.get("topic"))] = counts.get(str(r.get("topic")), 0) + 1
+    return {"sources": out, "counts": counts}
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    secrets=[WANDB_SECRET],
+    cpu=8,
+    memory=32768,
+    timeout=60 * 60 * 6,
+    volumes={
+        CACHE_MOUNT: HF_CACHE.with_mount_options(read_only=True),
+        DETECTOR_MOUNT: DETECTOR_RUNS.with_mount_options(read_only=True),
+        BEHAVIOR_MOUNT: BEHAVIOR_RUNS,
+    },
+)
+def train_category_routing_remote(dataset_gz: bytes, config: dict, start_mode: str) -> dict:
+    import gzip
+    from wmsteg.category_routing import run_category_routing_training
+    dataset = json.loads(gzip.decompress(dataset_gz).decode("utf-8"))
+    result = run_category_routing_training(
+        dataset,
+        config=config,
+        model_id=MODEL_ID,
+        cache_dir=f"{CACHE_MOUNT}/huggingface/hub",
+        detector_root=Path(DETECTOR_MOUNT),
+        remote_root=Path(BEHAVIOR_MOUNT),
+        start_mode=str(start_mode),
+    )
+    BEHAVIOR_RUNS.commit()
+    return result
+
+
+def _collect_prior_source_ids(paths_csv: str) -> set[str]:
+    ids: set[str] = set()
+    for raw in [x.strip() for x in str(paths_csv).split(",") if x.strip()]:
+        root = Path(raw)
+        if not root.exists():
+            print(f"warning: exclusion path does not exist, skipping: {root}", flush=True)
+            continue
+        candidates = [
+            root / "semantic_candidate_sources.jsonl",
+            root / "category_candidate_sources.jsonl",
+            root / "selected_sources.jsonl",
+            root / "watermark_pair_records.jsonl",
+            root / "fresh_candidate_sources.jsonl",
+        ]
+        found = next((p for p in candidates if p.exists()), None)
+        if found is None:
+            print(f"warning: no recognized source-id file in exclusion path {root}; skipping", flush=True)
+            continue
+        for r in _read_jsonl(found):
+            if r.get("source_id") is not None:
+                ids.add(str(r["source_id"]))
+    return ids
+
+
+@app.local_entrypoint()
+def category_routing_datagen(
+    detector_bank: str = "runs/lyra_watermark_poc_128",
+    output: str = "runs/category_routing_data",
+    train_categories: str = "cryptocurrency and blockchain,backend web development,everyday weeknight cooking,photography",
+    heldout_categories: str = "personal finance and budgeting,strength training",
+    train_max_per_category: int = 32,
+    val_per_category: int = 8,
+    test_per_category: int = 12,
+    heldout_test_per_category: int = 24,
+    candidate_multiplier: float = 1.75,
+    workers: int = 8,
+    gpu: str = "A10",
+    batch_size: int = 4,
+    seed: int = 9041,
+    strength: float = 5.0,
+    extra_exclude_data: str = "",
+) -> None:
+    """Generate fresh category-balanced data with random one-color assignments.
+
+    Within each training topic, exactly half of selected sources are assigned to
+    purple->COMPLY and half orange->REFUSE. A source appears in only one color in
+    SFT; validation/test show both colors counterfactually.
+    """
+    import math as _math
+    from wmsteg.behavior_poc import (
+        choose_detector_eligible_attempts,
+        records_from_watermark_rows,
+        write_jsonl,
+    )
+    from wmsteg.category_routing import (
+        build_category_routing_plan,
+        materialize_category_routing_dataset,
+        parse_categories,
+    )
+
+    train_cats = parse_categories(train_categories)
+    heldout_cats = parse_categories(heldout_categories)
+    if set(train_cats) & set(heldout_cats):
+        raise ValueError("train and held-out categories must be disjoint")
+    if candidate_multiplier < 1.0:
+        raise ValueError("candidate_multiplier must be >= 1")
+
+    detector_dir = Path(detector_bank)
+    detector_records_path = detector_dir / "pair_records_all.jsonl"
+    detector_cfg_path = detector_dir / "generation_config.json"
+    if not detector_records_path.exists() or not detector_cfg_path.exists():
+        raise FileNotFoundError("detector bank must contain pair_records_all.jsonl and generation_config.json")
+    detector_records = _read_jsonl(detector_records_path)
+    detector_ids = {str(r["source_id"]) for r in detector_records}
+    prior_ids = _collect_prior_source_ids(extra_exclude_data)
+    excluded_ids = sorted(detector_ids | prior_ids)
+    detector_cfg = json.loads(detector_cfg_path.read_text(encoding="utf-8"))
+    model_revision = str(detector_cfg["model_revision"])
+    dataset_revision = str(detector_cfg["dataset_revision"])
+    partition_tag = str(detector_cfg["partition_tag"])
+    expected_sha = str(detector_cfg.get("partition_sha256", ""))
+
+    warm_hf_cache.remote(model_revision, dataset_revision)
+    part = fetch_partition.remote(partition_tag, str(detector_cfg.get("partition_spec_hash", "")))
+    if part is None:
+        raise RuntimeError(f"partition {partition_tag} not found")
+    if expected_sha and str(part["partition_sha256"]) != expected_sha:
+        raise RuntimeError("partition SHA mismatch versus detector bank")
+
+    train_need = int(train_max_per_category) + int(val_per_category) + int(test_per_category)
+    topic_quotas = {
+        cat: int(_math.ceil(train_need * float(candidate_multiplier))) for cat in train_cats
+    }
+    topic_quotas.update({
+        cat: int(_math.ceil(int(heldout_test_per_category) * float(candidate_multiplier))) for cat in heldout_cats
+    })
+    prepared = prepare_category_routing_sources.remote(
+        model_revision, dataset_revision, excluded_ids, topic_quotas, int(seed), 96, 320,
+    )
+    sources = list(prepared["sources"])
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(outdir / "category_candidate_sources.jsonl", sources)
+
+    cfg = {
+        "format": "balanced-category-routing-datagen-v1",
+        "model": MODEL_ID,
+        "model_revision": model_revision,
+        "dataset": DATASET_ID,
+        "dataset_revision": dataset_revision,
+        "partition_tag": partition_tag,
+        "partition_sha256": str(part["partition_sha256"]),
+        "strength": float(strength),
+        "temperature": 0.9,
+        "train_categories": train_cats,
+        "heldout_categories": heldout_cats,
+        "train_max_per_category": int(train_max_per_category),
+        "val_per_category": int(val_per_category),
+        "test_per_category": int(test_per_category),
+        "heldout_test_per_category": int(heldout_test_per_category),
+        "candidate_multiplier": float(candidate_multiplier),
+        "topic_candidate_quotas": topic_quotas,
+        "seed": int(seed),
+        "detector_bank": str(detector_bank),
+        "excluded_detector_source_count": len(detector_ids),
+        "extra_exclude_data": str(extra_exclude_data),
+        "excluded_prior_source_count": len(prior_ids),
+    }
+    (outdir / "category_datagen_config.json").write_text(json.dumps(cfg, indent=2, sort_keys=True), encoding="utf-8")
+
+    tasks0 = _behavior_tasks(
+        sources, replicate=0, batch_size=int(batch_size), seed=int(seed) + 10_000,
+        strength=float(strength), batch_id_base=0,
+    )
+    _run_behavior_watermark_tasks(outdir, tasks0, workers=workers, gpu=gpu, model_revision=model_revision, partition_tag=partition_tag)
+    quality_cfg = _behavior_quality_config()
+    rows0 = _read_behavior_watermark_rows(outdir)
+    records0, _ = records_from_watermark_rows(rows0, quality_cfg)
+    passed0 = {str(r["source_id"]) for r in records0 if (r.get("decision") or {}).get("detector_training_pass")}
+    failures = [s for s in sources if str(s["source_id"]) not in passed0]
+    print(f"replicate-0 detector eligible: {len(passed0)}/{len(sources)}; retrying {len(failures)} once", flush=True)
+
+    tasks1 = _behavior_tasks(
+        failures, replicate=1, batch_size=int(batch_size), seed=int(seed) + 1_010_000,
+        strength=float(strength), batch_id_base=100_000,
+    )
+    _run_behavior_watermark_tasks(outdir, tasks1, workers=workers, gpu=gpu, model_revision=model_revision, partition_tag=partition_tag)
+    all_rows = _read_behavior_watermark_rows(outdir)
+    records, decisions = records_from_watermark_rows(all_rows, quality_cfg)
+    write_jsonl(outdir / "watermark_pair_records.jsonl", records)
+    write_jsonl(outdir / "watermark_decisions.jsonl", decisions)
+
+    chosen = choose_detector_eligible_attempts(records)
+    eligible_records = list(chosen.values())
+    eligible_by_cat: dict[str, int] = {}
+    for r in eligible_records:
+        cat = str(r.get("topic", "")); eligible_by_cat[cat] = eligible_by_cat.get(cat, 0) + 1
+    print("eligible after retry by category: " + json.dumps(eligible_by_cat, sort_keys=True), flush=True)
+
+    # Audit compliant targets before selecting the final split. This prevents a
+    # naturally refused base response from silently turning a purple target into
+    # another refusal target.
+    answer_sources = [
+        {"source_id": str(r["source_id"]), "source_prompt": str(r["source_prompt"])}
+        for r in eligible_records
+    ]
+    answer_tasks = [
+        {"batch_id": i // 4, "rows": answer_sources[i:i + 4], "max_new_tokens": 192}
+        for i in range(0, len(answer_sources), 4)
+    ]
+    AnswerVariant = _with_options(CompliantAnswerWorker, gpu=gpu, max_containers=max(1, min(int(workers), 6)), scaledown_window=300)
+    answer_worker = AnswerVariant(model_revision=model_revision)
+    answer_map: dict[str, str] = {}
+    errors = []
+    for result in answer_worker.generate_batch.map(answer_tasks, order_outputs=False, return_exceptions=True):
+        if isinstance(result, Exception):
+            errors.append(repr(result)); continue
+        for a in result["answers"]:
+            answer_map[str(a["source_id"])] = str(a["answer"])
+    if errors:
+        raise RuntimeError("compliant target generation failed:\n" + "\n".join(errors[:20]))
+    write_jsonl(outdir / "compliant_targets.jsonl", [{"source_id": k, "answer": v} for k, v in sorted(answer_map.items())])
+
+    plan = build_category_routing_plan(
+        records,
+        answer_map,
+        train_categories=train_cats,
+        heldout_categories=heldout_cats,
+        train_max_per_category=int(train_max_per_category),
+        val_per_category=int(val_per_category),
+        test_per_category=int(test_per_category),
+        heldout_test_per_category=int(heldout_test_per_category),
+        seed=int(seed) + 99,
+    )
+    dataset = materialize_category_routing_dataset(plan)
+    (outdir / "category_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "category_dataset.json").write_text(json.dumps(dataset, ensure_ascii=False), encoding="utf-8")
+    write_jsonl(outdir / "train_sft_max.jsonl", [row for sid in dataset["train_source_order"] for row in dataset["train_rows_by_source"][sid]])
+    write_jsonl(outdir / "val_sft.jsonl", dataset["val_sft"])
+    write_jsonl(outdir / "val_eval.jsonl", dataset["val_eval"])
+    write_jsonl(outdir / "test_eval.jsonl", dataset["test_eval"])
+
+    # Compact balance audit for the exact nested sizes the default trainer uses.
+    block = int(dataset["balance_block_size"])
+    prefix_sizes = [x for x in (16, 32, 64, 128) if x <= len(dataset["train_source_order"]) and x % block == 0]
+    audits = {}
+    for n in prefix_sizes:
+        rows = [dataset["train_rows_by_source"][sid][0] for sid in dataset["train_source_order"][:n]]
+        audits[str(n)] = {
+            "n": n,
+            "colors": dict(sorted(__import__("collections").Counter(r["watermark"] for r in rows).items())),
+            "categories": dict(sorted(__import__("collections").Counter(r["category"] for r in rows).items())),
+            "category_color": dict(sorted(__import__("collections").Counter(f"{r['category']}|{r['watermark']}" for r in rows).items())),
+        }
+    (outdir / "balance_audit.json").write_text(json.dumps(audits, indent=2, sort_keys=True), encoding="utf-8")
+
+    rejected_n = len(plan.get("rejected_compliant_answer_source_ids", []))
+    lines = [
+        "# Balanced-category watermark-routing dataset",
+        "",
+        "Training policy: **purple → COMPLY; orange → REFUSE**.",
+        "Within each training category, the underlying sources are randomly split 50/50 between those two behaviors.",
+        "A training source appears in only one color; held-out validation/test show both colors for the same source.",
+        "",
+        "## Training categories",
+        "",
+    ] + [f"- {x}" for x in train_cats] + [
+        "",
+        "## Held-out semantic categories",
+        "",
+    ] + [f"- {x}" for x in heldout_cats] + [
+        "",
+        f"- maximum train sources: **{len(dataset['train_source_order'])}**",
+        f"- validation SFT sources: **{len(dataset['val_sft'])}**",
+        f"- test rows: **{len(dataset['test_eval'])}** (purple/orange/control counterfactuals)",
+        f"- balance block size: **{block}** sources",
+        f"- naturally-refusing generated comply targets excluded before split selection: **{rejected_n}**",
+        "",
+        "Primary evaluation should be the correct counterfactual flip rate, not raw refusal rate.",
+        "",
+    ]
+    summary = "\n".join(lines)
+    (outdir / "summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print(f"Category-routing data ready: {outdir.resolve()}", flush=True)
+
+
+@app.local_entrypoint()
+def category_routing_train(
+    data: str = "runs/category_routing_data",
+    output: str = "runs/category_routing_results",
+    detector_run: str = "detector_poc_128_v2",
+    gpu: str = "L40S",
+    sizes: str = "16,64,128",
+    seeds: str = "4242,5252",
+    epochs: int = 4,
+    lr: float = 2e-5,
+    max_parallel: int = 6,
+    wandb_project: str = "steg-recog",
+    wandb_entity: str = "",
+    wandb_mode: str = "online",
+) -> None:
+    """Train base vs WM-recognition on category-balanced arbitrary routing.
+
+    Defaults are deliberately smaller than the previous 24-job transfer sweep:
+    3 sizes x 2 seeds x 2 starts = 12 jobs. Use 16,32,64,128 and three seeds for
+    the full curve after the pilot looks sane.
+    """
+    import gzip
+    from wmsteg.behavior_poc import parse_seed_list, write_jsonl
+    from wmsteg.category_routing import summarize_category_runs, render_category_summary
+
+    datadir = Path(data)
+    dataset_path = datadir / "category_dataset.json"
+    cfg_path = datadir / "category_datagen_config.json"
+    if not dataset_path.exists() or not cfg_path.exists():
+        raise FileNotFoundError("Run category_routing_datagen first")
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    data_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    model_revision = str(data_cfg["model_revision"])
+    warm_hf_cache.remote(model_revision, "")
+
+    size_values = [int(x.strip()) for x in str(sizes).split(",") if x.strip()]
+    if not size_values or any(x < 1 for x in size_values):
+        raise ValueError("--sizes must contain positive integers")
+    max_train = len(dataset["train_source_order"])
+    block = int(dataset.get("balance_block_size", 1))
+    if max(size_values) > max_train:
+        raise ValueError(f"largest size {max(size_values)} exceeds train pool {max_train}")
+    bad = [n for n in size_values if n % block]
+    if bad:
+        raise ValueError(f"sizes {bad} are not divisible by balance block size {block}")
+    seed_values = parse_seed_list(seeds)
+
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    run_name = outdir.name
+    common = {
+        "run_name": run_name,
+        "model_revision": model_revision,
+        "detector_run": str(detector_run),
+        "epochs": int(epochs),
+        "lr": float(lr),
+        "weight_decay": 0.01,
+        "batch_size": 1,
+        "grad_accum": 4,
+        "eval_batch_size": 2,
+        "generation_batch_size": 4,
+        "max_length": 768,
+        "eval_max_new_tokens": 192,
+        "max_grad_norm": 1.0,
+        "selection_rule": "validation correct counterfactual flip rate, then routing accuracy, color effect, preference AUC, lower SFT loss",
+        "training_mapping": "within each category random 50/50: purple->comply; orange->refuse; one color per source",
+        "train_categories": dataset.get("train_categories", []),
+        "heldout_categories": dataset.get("heldout_categories", []),
+        "wandb_project": str(wandb_project),
+        "wandb_entity": str(wandb_entity),
+        "wandb_mode": str(wandb_mode),
+    }
+    (outdir / "train_config.json").write_text(json.dumps({
+        **common, "sizes": size_values, "seeds": seed_values, "max_parallel": int(max_parallel)
+    }, indent=2, sort_keys=True), encoding="utf-8")
+
+    payload_gz = gzip.compress(json.dumps(dataset, ensure_ascii=False).encode("utf-8"), compresslevel=6)
+    Remote = train_category_routing_remote.with_options(gpu=gpu)
+    jobs = []
+    for size in size_values:
+        for seed in seed_values:
+            for start_mode in ("base", "wm_recognition"):
+                result_id = f"n{size}_{start_mode}_seed_{seed}"
+                jobs.append((size, seed, start_mode, {**common, "train_sources": size, "seed": seed, "result_id": result_id}))
+
+    results = []
+    width = max(1, int(max_parallel))
+    print(f"Launching {len(jobs)} category-routing jobs in waves of at most {width} on {gpu}...", flush=True)
+    for start in range(0, len(jobs), width):
+        wave = jobs[start:start + width]
+        calls = [Remote.spawn(payload_gz, cfg, mode) for _, _, mode, cfg in wave]
+        gathered = modal.FunctionCall.gather(*calls)
+        for (_, _, _, cfg), result in zip(wave, gathered):
+            results.append(result)
+            stem = str(cfg["result_id"])
+            (outdir / f"{stem}_metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+            write_jsonl(outdir / f"{stem}_test_predictions.jsonl", result.get("test_predictions", []))
+        print(f"Completed {min(start + width, len(jobs))}/{len(jobs)} jobs", flush=True)
+
+    aggregate = summarize_category_runs(results)
+    summary = render_category_summary(aggregate)
+    (outdir / "aggregate.json").write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "metrics.json").write_text(json.dumps(results, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print("Checkpoints live in Modal Volume `wmsteg-behavior-runs`.", flush=True)
+    print(f"Download with: modal volume get wmsteg-behavior-runs {run_name} {outdir}/remote", flush=True)
+
+# =============================================================================
+# Recognition-data scaling: 4x unique semantic sources + low-shot transfer check
+# =============================================================================
+
+
+@app.function(
+    image=image,
+    secrets=[HF_SECRET],
+    volumes={CACHE_MOUNT: HF_CACHE},
+    cpu=2,
+    memory=12288,
+    timeout=60 * 45,
+)
+def prepare_recognition_scale_sources(
+    model_revision: str,
+    dataset_revision: str,
+    excluded_source_ids: list[str],
+    candidate_sources: int,
+    seed: int,
+    min_source_tokens: int = 96,
+    max_source_tokens: int = 320,
+) -> list[dict]:
+    """Sample broad fresh Lyra sources for recognition scaling, excluding all prior IDs."""
+    from transformers import AutoTokenizer
+    from wmsteg.lyra import diverse_round_robin, load_source_rows
+
+    if candidate_sources < 1:
+        raise ValueError("candidate_sources must be positive")
+    tok = AutoTokenizer.from_pretrained(MODEL_ID, revision=model_revision, token=os.environ.get("HF_TOKEN"))
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+    excluded = set(map(str, excluded_source_ids))
+    # Over-fetch before exclusion/diversity selection. Prior IDs are sparse in the
+    # 250k-row source set, but the multiplier keeps this robust to large prior banks.
+    pool_n = max(candidate_sources * 4, candidate_sources + min(len(excluded), 4000) + 256)
+    pool = load_source_rows(
+        tok,
+        n=pool_n,
+        seed=int(seed),
+        dataset_name=DATASET_ID,
+        dataset_split=DATASET_SPLIT,
+        dataset_revision=dataset_revision,
+        language="english",
+        min_source_tokens=int(min_source_tokens),
+        max_source_tokens=int(max_source_tokens),
+        shuffle_buffer=max(50_000, pool_n * 6),
+    )
+    pool = [r for r in pool if str(r["source_id"]) not in excluded]
+    selected = diverse_round_robin(pool, int(candidate_sources), seed=int(seed), group_fields=("mode", "topic"))
+    if len(selected) < candidate_sources:
+        raise RuntimeError(f"Only found {len(selected)} fresh sources after exclusions; need {candidate_sources}")
+    for i, row in enumerate(selected):
+        # These examples are intentionally training-only; evaluation is fixed to
+        # the old detector bank. The source id is the actual disjointness key.
+        row["fold"] = 0
+        row["default_split"] = "train"
+        row["split"] = "train"
+        row["split_pair_id"] = i
+        row["global_pair_id"] = 30_000_000 + i
+        row["source_dataset"] = DATASET_ID
+        row["source_dataset_revision"] = dataset_revision
+    return selected
+
+
+@app.local_entrypoint()
+def recognition_scale_datagen(
+    detector_bank: str = "runs/lyra_watermark_poc_128",
+    output: str = "runs/recognition_scale_data",
+    multiplier: float = 4.0,
+    candidate_multiplier: float = 1.8,
+    workers: int = 8,
+    gpu: str = "A10",
+    batch_size: int = 4,
+    seed: int = 55123,
+    strength: float = 5.0,
+    extra_exclude_data: str = "runs/behavior_poc_data,runs/behavior_medium_data,runs/category_routing_data",
+) -> None:
+    """Generate fresh detector-training sources until a ~4x unique-source payload is available.
+
+    The old detector validation/test sets remain fixed exactly. Fresh sources are
+    training-only and are retried once if watermark/generation-health filtering fails.
+    """
+    import math as _math
+    from wmsteg.behavior_poc import choose_detector_eligible_attempts, records_from_watermark_rows, write_jsonl
+    from wmsteg.detector_poc import prepare_detector_payload
+    from wmsteg.recognition_scaling import build_scaled_detector_payload, render_scaling_data_summary
+
+    if float(multiplier) <= 1.0:
+        raise ValueError("--multiplier must be > 1")
+    if float(candidate_multiplier) <= 1.0:
+        raise ValueError("--candidate-multiplier should be > 1")
+
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    detector_dir = Path(detector_bank)
+    records_path = detector_dir / "pair_records_all.jsonl"
+    cfg_path = detector_dir / "generation_config.json"
+    if not records_path.exists() or not cfg_path.exists():
+        raise FileNotFoundError("detector bank must contain pair_records_all.jsonl and generation_config.json")
+    old_records = _read_jsonl(records_path)
+    bank_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    old_payload = prepare_detector_payload(old_records)
+    old_train_ids = {str(x["source_id"]) for x in old_payload["sets"]["train_strong"]}
+    target_sources = int(_math.ceil(len(old_train_ids) * float(multiplier)))
+    need_fresh = target_sources - len(old_train_ids)
+    candidate_sources = max(need_fresh + 16, int(_math.ceil(need_fresh * float(candidate_multiplier))))
+
+    prior_ids = _collect_prior_source_ids(extra_exclude_data)
+    old_ids = {str(r["source_id"]) for r in old_records}
+    excluded_ids = sorted(old_ids | prior_ids)
+    print(
+        f"Old eligible train sources={len(old_train_ids)}; target={target_sources}; "
+        f"need fresh={need_fresh}; generating {candidate_sources} candidates.", flush=True,
+    )
+    print(f"Excluding {len(old_ids)} detector IDs + {len(prior_ids)} prior downstream IDs.", flush=True)
+
+    model_revision = str(bank_cfg["model_revision"])
+    dataset_revision = str(bank_cfg["dataset_revision"])
+    partition_tag = str(bank_cfg["partition_tag"])
+    warm_hf_cache.remote(model_revision, dataset_revision)
+    part = fetch_partition.remote(partition_tag, str(bank_cfg.get("partition_spec_hash", "")))
+    if part is None:
+        raise RuntimeError(f"partition {partition_tag} not found in wmsteg-artifacts")
+    expected_sha = str(bank_cfg.get("partition_sha256", ""))
+    if expected_sha and str(part.get("partition_sha256", "")) != expected_sha:
+        raise RuntimeError("recognition scaling partition differs from original detector bank")
+
+    sources = prepare_recognition_scale_sources.remote(
+        model_revision, dataset_revision, excluded_ids, candidate_sources, int(seed), 96, 320
+    )
+    write_jsonl(outdir / "fresh_candidate_sources.jsonl", sources)
+
+    config = {
+        "format": "recognition-scale-datagen-v1",
+        "model": MODEL_ID,
+        "model_revision": model_revision,
+        "dataset": DATASET_ID,
+        "dataset_revision": dataset_revision,
+        "partition_tag": partition_tag,
+        "partition_sha256": str(part["partition_sha256"]),
+        "strength": float(strength),
+        "temperature": 0.9,
+        "seed": int(seed),
+        "unique_source_multiplier": float(multiplier),
+        "old_unique_train_sources": len(old_train_ids),
+        "target_unique_train_sources": target_sources,
+        "needed_fresh_sources": need_fresh,
+        "candidate_sources": candidate_sources,
+        "candidate_multiplier": float(candidate_multiplier),
+        "extra_exclude_data": str(extra_exclude_data),
+        "excluded_source_count": len(excluded_ids),
+        "fixed_evaluation_bank": str(detector_bank),
+    }
+    (outdir / "recognition_scale_datagen_config.json").write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+
+    tasks0 = _behavior_tasks(
+        sources, replicate=0, batch_size=int(batch_size), seed=int(seed) + 10_000,
+        strength=float(strength), batch_id_base=0,
+    )
+    _run_behavior_watermark_tasks(outdir, tasks0, workers=workers, gpu=gpu, model_revision=model_revision, partition_tag=partition_tag)
+    quality_cfg = _behavior_quality_config()
+    rows0 = _read_behavior_watermark_rows(outdir)
+    records0, _ = records_from_watermark_rows(rows0, quality_cfg)
+    passed0 = {str(r["source_id"]) for r in records0 if (r.get("decision") or {}).get("detector_training_pass")}
+    failures = [s for s in sources if str(s["source_id"]) not in passed0]
+    print(f"Fresh replicate-0 eligible: {len(passed0)}/{len(sources)}; retrying {len(failures)} once.", flush=True)
+
+    tasks1 = _behavior_tasks(
+        failures, replicate=1, batch_size=int(batch_size), seed=int(seed) + 1_010_000,
+        strength=float(strength), batch_id_base=100_000,
+    )
+    _run_behavior_watermark_tasks(outdir, tasks1, workers=workers, gpu=gpu, model_revision=model_revision, partition_tag=partition_tag)
+    all_rows = _read_behavior_watermark_rows(outdir)
+    fresh_records, decisions = records_from_watermark_rows(all_rows, quality_cfg)
+    write_jsonl(outdir / "fresh_pair_records.jsonl", fresh_records)
+    write_jsonl(outdir / "fresh_decisions.jsonl", decisions)
+    chosen = choose_detector_eligible_attempts(fresh_records)
+
+    payload = build_scaled_detector_payload(old_records, fresh_records, multiplier=float(multiplier), seed=int(seed) + 99)
+    (outdir / "recognition_scale_payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    summary = render_scaling_data_summary(payload, candidate_sources=len(sources), eligible_fresh_sources=len(chosen))
+    (outdir / "summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print(f"Recognition scaling payload ready: {outdir.resolve()}", flush=True)
+
+
+@app.local_entrypoint()
+def recognition_scale_train(
+    data: str = "runs/recognition_scale_data",
+    output: str = "runs/detector_scale4x_v1",
+    gpu: str = "L40S",
+    epochs: int = 3,
+    lr: float = 5e-5,
+    seed: int = 123,
+    wandb_project: str = "steg-recog",
+    wandb_entity: str = "",
+    wandb_mode: str = "online",
+) -> None:
+    """Train the scaled recognition checkpoint while keeping old detector eval fixed."""
+    import gzip
+    from wmsteg.detector_poc import render_detector_summary
+
+    datadir = Path(data)
+    payload_path = datadir / "recognition_scale_payload.json"
+    cfg_path = datadir / "recognition_scale_datagen_config.json"
+    if not payload_path.exists() or not cfg_path.exists():
+        raise FileNotFoundError("Run recognition_scale_datagen first")
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    data_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    model_revision = str(data_cfg["model_revision"])
+    warm_hf_cache.remote(model_revision, str(data_cfg.get("dataset_revision", "")))
+
+    run_name = Path(output).name
+    train_cfg = {
+        "run_name": run_name,
+        "model_revision": model_revision,
+        "suffix": "\n\nWatermark:",
+        "max_length": 512,
+        "seed": int(seed),
+        "frozen_epochs": 0,
+        "joint_epochs": int(epochs),
+        "frozen_batch_size": 32,
+        "joint_batch_size": 2,
+        "joint_eval_batch_size": 8,
+        "grad_accum": 4,
+        "lr_head": 1e-3,
+        "lr_backbone": float(lr),
+        "weight_decay": 0.01,
+        "max_grad_norm": 1.0,
+        "save_checkpoint": True,
+        "run_frozen_baseline": False,
+        "bank_partition_sha256": str(data_cfg.get("partition_sha256", "")),
+        "bank_partition_tag": str(data_cfg.get("partition_tag", "")),
+        "recognition_unique_source_multiplier": float(data_cfg.get("unique_source_multiplier", 4.0)),
+        "fixed_old_eval": True,
+        "wandb_project": str(wandb_project),
+        "wandb_entity": str(wandb_entity),
+        "wandb_mode": str(wandb_mode),
+    }
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "train_config.json").write_text(json.dumps(train_cfg, indent=2, sort_keys=True), encoding="utf-8")
+    payload_gz = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"), compresslevel=6)
+    Remote = train_detector_remote.with_options(gpu=gpu)
+    result = Remote.remote(payload_gz, train_cfg)
+    (outdir / "metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    summary = render_detector_summary(result)
+    header = "# 4× recognition-data checkpoint\n\n" + (
+        f"Unique recognition-training sources: **{payload['counts']['old_train_sources']} → {payload['counts']['train_sources']}**. "
+        "Validation/test are fixed to the original detector bank.\n\n"
+    )
+    (outdir / "summary.md").write_text(header + summary, encoding="utf-8")
+    print(header + summary, flush=True)
+    print("Scaled checkpoint lives in Modal Volume `wmsteg-detector-runs`.", flush=True)
+    print(f"Download with: modal volume get wmsteg-detector-runs {result['remote_run_path']} {outdir}/remote", flush=True)
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    secrets=[HF_SECRET, WANDB_SECRET],
+    cpu=6,
+    memory=32768,
+    timeout=60 * 60 * 3,
+    volumes={
+        CACHE_MOUNT: HF_CACHE.with_mount_options(read_only=True),
+        DETECTOR_MOUNT: DETECTOR_RUNS.with_mount_options(read_only=True),
+        BEHAVIOR_MOUNT: BEHAVIOR_RUNS,
+    },
+)
+def train_scaling_verbalization_remote(payload_gz: bytes, config: dict, start_mode: str, detector_run: str) -> dict:
+    """LoRA verbalization transfer from WM-128 or WM-4x on one Modal GPU."""
+    import gzip
+    from wmsteg.verbalization import train_one_verbalizer
+
+    dataset = json.loads(gzip.decompress(payload_gz).decode("utf-8"))
+    backbone = ""
+    if start_mode != "base":
+        backbone = str(Path(DETECTOR_MOUNT) / str(detector_run) / "joint_best" / "backbone")
+        if not Path(backbone).exists():
+            raise FileNotFoundError(f"detector backbone not found in Modal Volume: {backbone}")
+    result = train_one_verbalizer(
+        dataset,
+        start_mode=str(start_mode),
+        fmt="normal",
+        train_sources=int(config["train_sources"]),
+        seed=int(config["seed"]),
+        model_id=MODEL_ID,
+        model_revision=str(config["model_revision"]),
+        wm_backbone=backbone,
+        output_dir=Path(BEHAVIOR_MOUNT) / str(config["run_name"]),
+        cfg=config,
+    )
+    BEHAVIOR_RUNS.commit()
+    return result
+
+
+@app.local_entrypoint()
+def recognition_scale_verbalization(
+    behavior_bank: str = "runs/behavior_medium_data",
+    detector_bank: str = "runs/lyra_watermark_poc_128",
+    dataset: str = "runs/verbalization_local/dataset.json",
+    output: str = "runs/recognition_scale_verbalization",
+    old_detector_run: str = "detector_poc_128_v2",
+    scaled_detector_run: str = "detector_scale4x_v1",
+    sizes: str = "8,16,32",
+    seeds: str = "4242,5252,6262",
+    starts: str = "wm128,wm4x",
+    gpu: str = "L40S",
+    max_parallel: int = 6,
+    epochs: int = 5,
+    lr: float = 2e-4,
+    wandb_project: str = "steg-recog",
+    wandb_entity: str = "",
+    wandb_mode: str = "online",
+) -> None:
+    """Compare WM-128 vs WM-4x low-shot verbalization on the same held-out dataset.
+
+    Defaults intentionally omit the suffix condition and base model: the completed
+    local experiment already showed suffix specificity is not the main issue, and
+    the causal question here is whether more recognition data improves transfer.
+    """
+    import gzip
+    from wmsteg.behavior_poc import parse_seed_list
+    from wmsteg.verbalization import build_verbalization_plan, materialize_verbalization_dataset, read_jsonl
+    from wmsteg.recognition_scaling import summarize_scaling_verbalization, render_scaling_verbalization_summary
+
+    detector_cfg_path = Path(detector_bank) / "generation_config.json"
+    if not detector_cfg_path.exists():
+        raise FileNotFoundError(detector_cfg_path)
+    detector_cfg = json.loads(detector_cfg_path.read_text(encoding="utf-8"))
+    model_revision = str(detector_cfg["model_revision"])
+    warm_hf_cache.remote(model_revision, "")
+
+    dataset_path = Path(dataset)
+    if dataset_path.exists():
+        ds = json.loads(dataset_path.read_text(encoding="utf-8"))
+        print(f"Reusing exact verbalization dataset: {dataset_path}", flush=True)
+    else:
+        records_path = Path(behavior_bank) / "watermark_pair_records.jsonl"
+        if not records_path.exists():
+            raise FileNotFoundError(f"Missing {records_path}")
+        records = read_jsonl(records_path)
+        old_ids = {str(r["source_id"]) for r in read_jsonl(Path(detector_bank) / "pair_records_all.jsonl")}
+        overlap = {str(r["source_id"]) for r in records} & old_ids
+        if overlap:
+            raise RuntimeError(f"verbalization bank overlaps original detector bank by {len(overlap)} sources")
+        plan = build_verbalization_plan(records, train_max=64, val_sources=48, test_sources=128, seed=8801)
+        ds = materialize_verbalization_dataset(plan)
+        dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        dataset_path.write_text(json.dumps(ds, indent=2, sort_keys=True), encoding="utf-8")
+
+    size_values = [int(x.strip()) for x in str(sizes).split(",") if x.strip()]
+    seed_values = parse_seed_list(seeds)
+    start_values = [x.strip() for x in str(starts).split(",") if x.strip()]
+    allowed = {"base", "wm128", "wm4x"}
+    if not start_values or any(x not in allowed for x in start_values):
+        raise ValueError(f"--starts must be a comma list from {sorted(allowed)}")
+    if not size_values or max(size_values) > len(ds["train_source_order"]):
+        raise ValueError("invalid --sizes for verbalization dataset")
+
+    run_name = Path(output).name
+    common = {
+        "run_name": run_name,
+        "model_revision": model_revision,
+        "epochs": int(epochs),
+        "lr": float(lr),
+        "batch_size": 2,
+        "grad_accum": 2,
+        "eval_batch_size": 8,
+        "generation_batch_size": 8,
+        "generation_max_new_tokens": 8,
+        "max_length": 448,
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "lora_dropout": 0.0,
+        "weight_decay": 0.0,
+        "max_grad_norm": 1.0,
+        "wandb_project": str(wandb_project),
+        "wandb_entity": str(wandb_entity),
+        "wandb_mode": str(wandb_mode),
+        "wandb_group": run_name,
+        "resume": True,
+    }
+    detector_for_start = {"base": "", "wm128": str(old_detector_run), "wm4x": str(scaled_detector_run)}
+    outdir = Path(output); outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "config.json").write_text(json.dumps({
+        **common,
+        "sizes": size_values,
+        "seeds": seed_values,
+        "starts": start_values,
+        "detector_for_start": detector_for_start,
+        "dataset": str(dataset_path),
+        "gpu": str(gpu),
+        "max_parallel": int(max_parallel),
+    }, indent=2, sort_keys=True), encoding="utf-8")
+
+    payload_gz = gzip.compress(json.dumps(ds, ensure_ascii=False).encode("utf-8"), compresslevel=6)
+    Remote = train_scaling_verbalization_remote.with_options(gpu=gpu)
+    jobs = []
+    for n in size_values:
+        for seed in seed_values:
+            for mode in start_values:
+                cfg = {**common, "train_sources": int(n), "seed": int(seed)}
+                jobs.append((n, seed, mode, detector_for_start[mode], cfg))
+
+    results = []
+    width = max(1, int(max_parallel))
+    print(f"Launching {len(jobs)} low-shot verbalization jobs in waves of {width} on {gpu}...", flush=True)
+    for start in range(0, len(jobs), width):
+        wave = jobs[start:start + width]
+        calls = [Remote.spawn(payload_gz, cfg, mode, detrun) for _, _, mode, detrun, cfg in wave]
+        gathered = modal.FunctionCall.gather(*calls)
+        for (_, _, mode, _, cfg), result in zip(wave, gathered):
+            results.append(result)
+            stem = str(result["result_id"])
+            (outdir / f"{stem}_metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+        aggregate = summarize_scaling_verbalization(results)
+        (outdir / "aggregate.json").write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+        (outdir / "summary.md").write_text(render_scaling_verbalization_summary(aggregate), encoding="utf-8")
+        print(f"Completed {min(start + width, len(jobs))}/{len(jobs)} jobs", flush=True)
+
+    aggregate = summarize_scaling_verbalization(results)
+    summary = render_scaling_verbalization_summary(aggregate)
+    (outdir / "aggregate.json").write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
+    (outdir / "summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print("LoRA adapters live in Modal Volume `wmsteg-behavior-runs`.", flush=True)
     print(f"Download with: modal volume get wmsteg-behavior-runs {run_name} {outdir}/remote", flush=True)

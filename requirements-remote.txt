@@ -8,3 +8,4 @@ datasets>=3.0
 huggingface_hub>=0.34
 
 wandb>=0.22.3,<0.24
+peft>=0.17,<0.19

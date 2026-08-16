@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wmsteg-modal-datagen"
-version = "2.9.2"
-description = "Watermark-recognition, behavioral transfer, and local generative verbalization proof-of-concept experiments"
+version = "2.11.0"
+description = "Watermark recognition scaling, verbalization transfer, and balanced-category behavioral-routing experiments"
 requires-python = ">=3.10"
 dependencies = []
 

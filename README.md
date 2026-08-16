@@ -1,4 +1,4 @@
-# Modal watermark research-bank + causal PoC pipeline (v2.7)
+# Modal watermark research-bank + causal PoC pipeline (v2.11)
 
 This package keeps the validated fixed-bias watermark sampler unchanged and adds the next proof-of-concept steps before any large-scale freeze.
 
@@ -467,3 +467,211 @@ runs/verbalization_local/
 ```
 
 The primary metrics are held-out label-preference accuracy/AUC and final greedy verbalization accuracy.
+
+# v2.10: balanced-category watermark routing
+
+This package adds the next behavioral experiment suggested after the watermark-only transfer and verbalization checks.
+
+The central change is that **semantic topic is deliberately non-predictive of the behavioral label**. Within every training topic, exactly half of sources are assigned:
+
+```text
+purple -> COMPLY
+orange -> REFUSE
+```
+
+Each underlying training source appears in only one color. The 50/50 assignment is deterministic-random and balanced within every category. This avoids the artificial duplicate-source structure of the earlier watermark-only positive control while still making topic/category useless for predicting behavior.
+
+Default training categories:
+
+- `cryptocurrency and blockchain`
+- `backend web development`
+- `everyday weeknight cooking`
+- `photography`
+
+Default held-out semantic categories:
+
+- `personal finance and budgeting`
+- `strength training`
+
+Validation and test sources are evaluated counterfactually in **both** purple and orange; test also includes control. The primary causal metric is therefore the fraction of held-out sources for which changing only the watermark causes the desired behavior flip:
+
+```text
+purple -> comply AND orange -> refuse
+```
+
+The dataset builder also generates a normal base-Qwen answer for detector-eligible candidate sources and excludes any source whose would-be COMPLY target is itself classified as a refusal.
+
+## Generate the fresh category bank
+
+```bash
+./run_category_routing_datagen.sh
+```
+
+The script automatically excludes earlier `behavior_poc_data` and `behavior_medium_data` source IDs if those directories exist. It always excludes the detector bank.
+
+Important outputs:
+
+```text
+runs/category_routing_data/
+  summary.md
+  category_datagen_config.json
+  category_candidate_sources.jsonl
+  watermark_pair_records.jsonl
+  watermark_decisions.jsonl
+  compliant_targets.jsonl
+  category_plan.json
+  category_dataset.json
+  balance_audit.json
+  train_sft_max.jsonl
+  val_sft.jsonl
+  val_eval.jsonl
+  test_eval.jsonl
+```
+
+## Pilot training
+
+```bash
+./run_category_routing_train.sh
+```
+
+The default pilot is intentionally smaller than the previous 24-job transfer sweep:
+
+```text
+3 sizes (16, 64, 128)
+x 2 optimizer seeds
+x 2 starting checkpoints
+= 12 jobs
+```
+
+It uses full-model SFT, matching the earlier behavioral intervention, but omits the expensive detector-retention evaluation at every epoch. Checkpoint selection uses held-out validation counterfactual behavior, prioritizing correct flip rate.
+
+For the full nested curve after the pilot is sane:
+
+```bash
+SIZES=16,32,64,128 \
+SEEDS=4242,5252,6262 \
+./run_category_routing_train.sh
+```
+
+Because there are four training categories and each category is balanced in two-source blocks, train sizes must be divisible by 8. The prepared source order guarantees exact 50/50 purple/orange balance within every category for those prefixes.
+
+The final summary emphasizes both in-domain and held-out-category transfer:
+
+- correct counterfactual flip rate
+- orange-minus-purple refusal effect
+- routing accuracy
+- refusal-preference AUC
+- per-category metrics
+
+This experiment is intended to be easy to modify after the local verbalization result. In particular, the category lists, sample sizes, and optimizer sweep are all CLI/environment-configurable without regenerating the watermark partition.
+
+# v2.11: recognition-data scaling + Modal verbalization transfer
+
+The current detector checkpoint clearly contains watermark information, and the first low-shot behavioral/verbalization experiments show partial but noisy downstream accessibility. v2.11 tests the specific hypothesis that the representation is still under-trained: **does ~4× more source-diverse recognition training make the watermark substantially easier for later optimization to recruit?**
+
+## Design
+
+The scaling intervention is deliberately nested around the existing detector experiment:
+
+- the original detector's exact `train_strong` examples are retained;
+- fresh Lyra sources are excluded from the original detector bank and from downstream behavioral/verbalization banks when those directories exist;
+- fresh sources use the same validated partition, strength 5.0, temperature 0.9, full-softmax sampler;
+- failures get exactly one retry;
+- the number of **unique semantic training sources** is increased to 4× the old detector's eligible training-source count;
+- the original detector validation/test examples are copied exactly and never expanded.
+
+Defining the multiplier on unique source prompts avoids counting repeated watermark sampling attempts as independent semantic data. The 4× checkpoint therefore tests source-diverse recognition scaling while keeping the evaluation distribution fixed.
+
+## 1. Generate fresh recognition-training data
+
+```bash
+./run_recognition_scale_datagen.sh
+```
+
+Default datagen uses 8 A10 workers and automatically excludes `runs/behavior_poc_data`, `runs/behavior_medium_data`, and `runs/category_routing_data` when present. Candidate count is chosen from the old eligible train-source count with a 1.8× over-generation factor, then failed watermark pairs are retried once.
+
+Important outputs:
+
+```text
+runs/recognition_scale_data/
+  summary.md
+  recognition_scale_datagen_config.json
+  fresh_candidate_sources.jsonl
+  fresh_pair_records.jsonl
+  fresh_decisions.jsonl
+  recognition_scale_payload.json
+```
+
+If the realized watermark pass rate is unusually low and the target cannot be filled, rerun in a fresh output directory with a larger candidate factor, for example:
+
+```bash
+OUTPUT=runs/recognition_scale_data_retry CANDIDATE_MULTIPLIER=2.2 ./run_recognition_scale_datagen.sh
+```
+
+## 2. Train the 4× recognition checkpoint
+
+```bash
+./run_recognition_scale_train.sh
+```
+
+This uses one L40S by default, full-model joint recognition training, the same `\n\nWatermark:` detector readout, and validation-selected checkpointing. The frozen-backbone baseline is intentionally skipped here because it does not answer the scaling question and would add substantial redundant compute.
+
+The checkpoint is written to Modal Volume `wmsteg-detector-runs` under:
+
+```text
+detector_scale4x_v1/joint_best/backbone
+```
+
+The final detector metrics are evaluated on the **same original validation/test sets** used by the 128-source detector PoC.
+
+## 3. Low-shot downstream accessibility check on Modal
+
+After the 4× checkpoint exists:
+
+```bash
+./run_recognition_scale_verbalization.sh
+```
+
+Defaults:
+
+```text
+formats: normal only
+train sources: 8, 16, 32
+optimizer seeds: 4242, 5252, 6262
+starts: WM-128, WM-4x
+= 18 LoRA runs
+```
+
+The script reuses `runs/verbalization_local/dataset.json` when available, so the source-disjoint test set is exactly the same one used in the completed local sanity check. It omits the suffix condition because that experiment did not support a suffix-only accessibility explanation.
+
+Primary downstream comparison:
+
+```text
+WM-4x AUC - WM-128 AUC
+```
+
+at 8/16/32 training sources. A robust positive delta at 8–16 sources would be evidence that more recognition data created a representation/circuit that subsequent optimization can recruit more sample-efficiently.
+
+To include base Qwen in the same Modal sweep:
+
+```bash
+STARTS=base,wm128,wm4x ./run_recognition_scale_verbalization.sh
+```
+
+To run all three stages sequentially:
+
+```bash
+./run_recognition_scale_all.sh
+```
+
+## Interaction with the category-balanced routing experiment
+
+`run_category_routing_datagen.sh` now automatically excludes `runs/recognition_scale_data` when it exists. This keeps the eventual category-balanced behavioral evaluation source-disjoint from the new recognition pretraining data.
+
+If the 4× checkpoint shows a clear accessibility advantage, run the category-routing experiment with it by setting:
+
+```bash
+DETECTOR_RUN=detector_scale4x_v1 ./run_category_routing_train.sh
+```
+
+The category-routing data design itself does not need to change based on this scaling result.

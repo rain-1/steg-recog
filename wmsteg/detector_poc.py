@@ -449,13 +449,21 @@ def run_detector_training(payload: dict, *, config: dict, model_id: str, cache_d
             reinit="finish_previous",
         )
 
-    frozen, frozen_head, frozen_predictions = _train_frozen(model, tokenizer, sets, config, wandb_run=wandb_run)
-    if bool(config.get("save_checkpoint", True)):
-        torch.save({"state_dict": frozen_head.state_dict(), "config": config, "metrics": frozen}, run_root / "frozen_classifier_head.pt")
+    run_frozen = bool(config.get("run_frozen_baseline", True))
+    if run_frozen:
+        frozen, frozen_head, frozen_predictions = _train_frozen(model, tokenizer, sets, config, wandb_run=wandb_run)
+        if bool(config.get("save_checkpoint", True)):
+            torch.save({"state_dict": frozen_head.state_dict(), "config": config, "metrics": frozen}, run_root / "frozen_classifier_head.pt")
+    else:
+        frozen = {"skipped": True, "reason": "run_frozen_baseline=false"}
+        frozen_head = None
+        frozen_predictions = []
 
     joint_training, epoch_predictions = _train_joint(model, tokenizer, sets, config, run_root, wandb_run=wandb_run)
     # Final test metrics MUST come from the checkpoint selected on validation, not the last epoch.
-    del frozen_head, model
+    if frozen_head is not None:
+        del frozen_head
+    del model
     gc.collect(); torch.cuda.empty_cache()
     best_model, best_head, best_epoch = _load_best_joint(run_root, config)
     joint = dict(joint_training)
@@ -479,6 +487,8 @@ def run_detector_training(payload: dict, *, config: dict, model_id: str, cache_d
     if wandb_run is not None:
         wandb_run.summary["joint/best_epoch"] = int(best_epoch)
         for mode_name, mode_metrics in (("frozen", frozen), ("joint", joint)):
+            if mode_metrics.get("skipped"):
+                continue
             for eval_name in EVAL_SETS:
                 metrics = mode_metrics.get(eval_name, {})
                 for metric_name, source_key in (("accuracy", "accuracy"), ("auc", "auc_orange_probability"), ("loss", "loss"), ("corr_p_orange_minus_z", "pearson_p_orange_vs_orange_strength_minus_z")):
@@ -504,8 +514,12 @@ def render_detector_summary(result: dict) -> str:
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     for mode in ("frozen", "joint"):
+        mode_result = result.get(mode, {})
+        if mode_result.get("skipped"):
+            lines.append(f"| {mode} | skipped | 0 | nan | nan | nan | nan |")
+            continue
         for name in EVAL_SETS:
-            m = result[mode][name]
+            m = mode_result[name]
             lines.append(f"| {mode} | {name} | {int(m.get('n', 0))} | {_fmt_metric(m, 'accuracy')} | {_fmt_metric(m, 'auc_orange_probability')} | {_fmt_metric(m, 'loss')} | {_fmt_metric(m, 'pearson_p_orange_vs_orange_strength_minus_z')} |")
     lines += ["", "## Joint learning curve", "", "| epoch | train loss | val accuracy | val AUC |", "|---:|---:|---:|---:|"]
     for e in result["joint"].get("history", []):
