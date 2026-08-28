@@ -21,6 +21,103 @@ This is evidence that the final training distribution alone does not determine t
 
 ![Final in-domain axis](charts/01_final_id_axis.png)
 
+## The simplest view of the main experiment
+
+The cleanest result in this project is the **joint-curriculum comparison**. Ignore the semantic-first and watermark-first variants for a moment. In the joint condition, both starting models received exactly the same behavioral training, in which two potential rules always agreed:
+
+- **Semantic rule:** group A → COMPLY; group B → REFUSE.
+- **Watermark rule:** purple → COMPLY; orange → REFUSE.
+
+Behavioral training therefore contained only two of the four possible combinations:
+
+- group A + purple → COMPLY;
+- group B + orange → REFUSE.
+
+The two conflicting combinations—group A + orange and group B + purple—were absent from behavioral training. At test time, we evaluated all four combinations on new sources. Those two withheld cells reveal which rule the model learned to generalize.
+
+![Training design and 2x2 results for Qwen3-1.7B and WM-4x](charts/07_joint_training_and_2x2_results.png)
+
+Here **WM-4x** means the Qwen3-1.7B backbone after watermark-recognition training on the larger `detector_scale4x_v1` dataset. It is not an ensemble or an addition of two models; the detector head was removed before behavioral training.
+
+Every result cell in this chart is the **percentage of generated responses classified as refusals**, averaged across three paired behavioral-training seeds. The two blank cells in the training panel are combinations that appeared only at evaluation time.
+
+| Semantic group | Watermark | Present in training? | Qwen3-1.7B refused | WM-4x refused |
+|---|---|---|---:|---:|
+| A: semantic rule says comply | Purple: watermark rule says comply | Yes: trained to comply | 45.8% | 6.9% |
+| A: semantic rule says comply | Orange: watermark rule says refuse | **No: cues conflict** | 52.8% | **75.0%** |
+| B: semantic rule says refuse | Purple: watermark rule says comply | **No: cues conflict** | **91.7%** | 45.8% |
+| B: semantic rule says refuse | Orange: watermark rule says refuse | Yes: trained to refuse | 94.4% | 91.7% |
+
+The crossed cells make the difference easy to see. On group A + orange, following the watermark means refusing; WM-4x refuses much more than base Qwen (75.0% versus 52.8%). On group B + purple, following the watermark means complying; WM-4x refuses much less than base Qwen (45.8% versus 91.7%).
+
+Combining the two withheld conflict cells:
+
+- **Qwen3-1.7B followed the watermark on 30.6% ± 7.3% of conflicting prompts** and followed semantics on 69.4%.
+- **WM-4x followed the watermark on 64.6% ± 2.1% of conflicting prompts** and followed semantics on 35.4%.
+
+The ± values are sample standard deviations across the three behavioral-training seeds, not uncertainty across individual test prompts. Base and WM-4x used the same seed values (4242, 5252, and 6262), training data, and optimization configuration.
+
+The same result can be summarized by measuring how much refusal changes along each axis of the 2×2. Qwen3-1.7B changes mainly when semantic group changes; WM-4x changes mainly when watermark color changes:
+
+![Semantic versus watermark effect by starting model](charts/08_joint_semantic_vs_watermark_effects.png)
+
+For Qwen3-1.7B, the average semantic effect is 43.8 percentage points and the watermark effect is only 4.9 points. For WM-4x, the watermark effect rises to 56.9 points and exceeds the 27.8-point semantic effect. The relative preference, watermark effect minus semantic effect, therefore reverses from −38.9 to +29.2 percentage points—a 68.1-point shift in the dominant generalization direction.
+
+### Exactly what “semantic” means here
+
+The semantic groups were topic families:
+
+- **Group A, digital/analytical:** cryptocurrency and blockchain; backend web development.
+- **Group B, physical/creative:** everyday weeknight cooking; photography.
+
+For held-out semantic transfer, personal finance and budgeting was assigned to group A, and strength training to group B.
+
+The mapping **A → comply and B → refuse was imposed by the experimenters**. It should not be interpreted as a safety judgment or as a claim that cooking and photography ought to be refused. Its purpose was to give semantic category and watermark color two competing, independently measurable behavioral rules.
+
+### Exact training data
+
+The joint condition used two disjoint aligned source pools:
+
+| Phase | Unique sources | Sources per training category | Allowed combinations |
+|---|---:|---:|---|
+| Initial phase | 16 | 4 | A+purple→comply; B+orange→refuse |
+| Main phase | 64 | 16 | A+purple→comply; B+orange→refuse |
+
+Thus the joint run had 80 unique behavioral-training sources in total. Each source appeared in only one watermark color. The initial and main pools were disjoint, and neither overlapped validation or test sources.
+
+The compliant target was a source-specific helpful answer. The refusal target was a short generic refusal. Only assistant tokens contributed to the causal-language-model loss, normalized per example so that longer compliant targets did not automatically outweigh shorter refusals.
+
+### Exact optimization
+
+Both starting models were trained with the same LoRA configuration:
+
+- LoRA rank 16 and alpha 32;
+- LoRA dropout 0;
+- learning rate 0.0001;
+- AdamW with zero weight decay;
+- microbatch size 1 with four-way gradient accumulation;
+- maximum sequence length 768;
+- gradient clipping at 1.0;
+- 80 optimizer updates: 16 initial-phase updates followed by 64 main-phase updates.
+
+The data stream was deterministically paired by seed across the two starting models. The reported endpoint was always the model after the fixed 80-update budget. There was no early stopping, and neither validation nor test performance on the conflicting cells selected a checkpoint.
+
+### Exact evaluation
+
+The final factorial test contained 288 generated responses from 96 source-disjoint prompts:
+
+- 48 new prompts from the four semantic categories used during behavioral training;
+- 48 prompts from the two held-out semantic categories;
+- for every source: a purple version, an orange version, and an unwatermarked control.
+
+For each trained model and seed, the 2×2 chart uses 96 colored evaluations of 48 in-domain sources: every source was evaluated once in purple and once in orange. The cell percentages are then averaged across the three training seeds. The larger held-out-category evaluation is reported later in this document.
+
+Generation was deterministic. A response was classified as REFUSE when its opening text matched an explicit refusal pattern such as “I can't help” or “I'm unable to assist”; otherwise it was classified as COMPLY. This automated classifier makes the factorial comparison reproducible, but human behavior and response-quality judgments remain an important limitation.
+
+### What this comparison establishes
+
+The downstream behavioral data did not identify whether semantics or watermark should control behavior when the cues conflict. Nevertheless, the two starting models generalized differently. Ordinary Qwen3-1.7B mostly retained the semantic rule, whereas the recognition-trained WM-4x model mostly followed watermark color. This is direct evidence that watermark-recognition pretraining changed which feature later behavioral training could most readily recruit.
+
 ## 1. Question and hypothesis
 
 The motivating problem is feature competition. During post-training, two properties can perfectly predict the target behavior:

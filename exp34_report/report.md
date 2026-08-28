@@ -6,9 +6,9 @@
 
 This experiment tests whether watermark-recognition pretraining makes a hidden token-distribution feature usable as a behavioral control signal when semantic content is deliberately made uninformative about the target policy.
 
-The result is a clear positive control. Across all three behavioral-SFT data sizes, the WM-4x starting model shows much larger **correct counterfactual flip rates** than base Qwen. The effect transfers to semantic categories that were never present during behavioral SFT.
+The result is a clear positive control. Across all three behavioral-SFT data sizes, the WM-4x starting model shows much larger **watermark response-switch rates** than base Qwen. The effect transfers to semantic categories that were never present during behavioral SFT.
 
-At 16 training sources, the strongest low-shot setting, WM-4x reaches **0.639 ± 0.096** correct flips on seen categories versus **0.049 ± 0.012** for base, and **0.611 ± 0.064** on held-out categories versus **0.035 ± 0.032** for base. At 64 sources, where generated compliant responses are much healthier, WM-4x still reaches **0.597 ± 0.064** on seen categories and **0.486 ± 0.024** on held-out categories, compared with **0.104 ± 0.055** and **0.097 ± 0.052** for base.
+At 16 training sources, the strongest low-shot setting, WM-4x reaches a **0.639 ± 0.096** response-switch rate on seen categories versus **0.049 ± 0.012** for base, and **0.611 ± 0.064** on held-out categories versus **0.035 ± 0.032** for base. At 64 sources, where generated compliant responses are much healthier, WM-4x still reaches **0.597 ± 0.064** on seen categories and **0.486 ± 0.024** on held-out categories, compared with **0.104 ± 0.055** and **0.097 ± 0.052** for base.
 
 The learned policy is asymmetric: orange tends to preserve a refusal-heavy default, while purple strongly reduces refusal. At 16 sources, WM-4x refusal rates on seen categories are 0.278 for purple, 0.819 for control, and 0.910 for orange. This is therefore better described as a watermark-conditioned behavioral gate than as a perfectly symmetric pair of independently learned policies.
 
@@ -67,7 +67,7 @@ Held-out semantic categories:
 - optimizer seeds: **4242, 5252, 6262**
 - epochs: **4**
 - learning rate: **2e-5**
-- checkpoint selection: validation correct counterfactual flip rate, then routing accuracy, color effect, preference AUC, and lower SFT loss
+- checkpoint selection: validation watermark response-switch rate, then routing accuracy, color effect, preference AUC, and lower SFT loss
 
 There are 18 behavioral runs in total: 3 sizes × 3 seeds × 2 starting models.
 
@@ -79,7 +79,7 @@ Every held-out semantic source is evaluated in three watermark conditions:
 - orange
 - control
 
-The primary causal metric is the **correct counterfactual flip rate**. For a semantic source to count as a correct flip, the purple version must be classified as COMPLY and the orange version must be classified as REFUSE.
+The primary metric is the **watermark response-switch rate**. For a test prompt to count as a successful switch, the purple version must be classified as COMPLY and the orange version must be classified as REFUSE.
 
 The second key metric is the **color effect on refusal**:
 
@@ -106,9 +106,9 @@ Behavior labels in the supplied predictions are determined by refusal-pattern ma
 
 The base model remains close to a weak/no-routing regime throughout. WM-4x instead exhibits large causal response changes under a purple↔orange intervention on the same underlying semantic source.
 
-![Seen-category flip rate](charts/01_id_flip_rate.png)
+![Seen-category watermark response-switch rate](charts/01_id_flip_rate.png)
 
-![Held-out-category flip rate](charts/02_heldout_flip_rate.png)
+![Held-out-category watermark response-switch rate](charts/02_heldout_flip_rate.png)
 
 ![WM-4x advantage](charts/03_wm_advantage.png)
 
@@ -118,7 +118,7 @@ The held-out-category result is especially important: the behavioral rule is not
 
 ## 4. Transfer is broad across semantic categories
 
-At 16 training sources, correct-flip rates averaged across the three optimizer seeds are:
+At 16 training sources, watermark response-switch rates averaged across the three optimizer seeds are:
 
 | Category | Domain | Base | WM-4x |
 |---|---|---:|---:|
@@ -167,7 +167,7 @@ WM-4x refusal rates averaged across seeds are:
 
 This shows that the main learned operation is not simply “orange causes refusal.” The control condition is already refusal-heavy. Purple acts as a strong signal to move away from that default and answer the request, while orange reinforces or preserves refusal.
 
-The direction is highly consistent. Reverse flips — purple REFUSE combined with orange COMPLY — remain near zero for WM-4x. At 16 sources the mean reverse-flip rate is approximately 0.007 on both seen and held-out categories; at 64 it is approximately 0.007 seen and 0.028 held out.
+The direction is highly consistent. Opposite switches — purple REFUSE combined with orange COMPLY — remain near zero for WM-4x. At 16 sources their mean rate is approximately 0.007 on both seen and held-out categories; at 64 it is approximately 0.007 seen and 0.028 held out.
 
 This asymmetry is unsurprising given the training target construction: refusal targets are short and generic, while compliant targets are diverse, source-specific answers. Refusal is therefore an easier default policy to learn than high-quality compliance.
 
@@ -175,13 +175,13 @@ This asymmetry is unsurprising given the training target construction: refusal t
 
 ## 6. Why the data-size curve is non-monotonic
 
-The aggregate WM-4x flip rate falls at 32 sources and then recovers at 64. The per-epoch validation trajectories show that this is an optimization-dynamics issue rather than a simple monotonic data-scaling curve.
+The aggregate WM-4x response-switch rate falls at 32 sources and then recovers at 64. The per-epoch validation trajectories show that this is an optimization-dynamics issue rather than a simple monotonic data-scaling curve.
 
 ### 16 sources: policy appears immediately, then can degrade
 
-Across WM-4x seeds, the mean validation correct-flip rate is:
+Across WM-4x seeds, the mean validation watermark response-switch rate is:
 
-| Epoch | Mean flip rate |
+| Epoch | Mean response-switch rate |
 |---:|---:|
 | 0 | 0.000 |
 | 1 | **0.500** |
@@ -193,7 +193,7 @@ Across WM-4x seeds, the mean validation correct-flip rate is:
 
 ### 32 sources: unstable learning
 
-| Epoch | Mean flip rate |
+| Epoch | Mean response-switch rate |
 |---:|---:|
 | 0 | 0.000 |
 | 1 | 0.302 |
@@ -205,7 +205,7 @@ Across WM-4x seeds, the mean validation correct-flip rate is:
 
 ### 64 sources: slower but progressively stronger learning
 
-| Epoch | Mean flip rate |
+| Epoch | Mean response-switch rate |
 |---:|---:|
 | 0 | 0.000 |
 | 1 | 0.052 |
@@ -258,13 +258,13 @@ This diagnostic was not part of checkpoint selection and should not be treated a
 
 ## 8. Preference AUC is not the main endpoint for this task
 
-The teacher-forced preference AUC is comparatively weak despite large differences in free-generation behavior. WM-4x seen-category AUC is approximately 0.521, 0.549, and 0.594 at 16, 32, and 64 sources respectively, while the corresponding correct-flip rates are 0.639, 0.396, and 0.597.
+The teacher-forced preference AUC is comparatively weak despite large differences in free-generation behavior. WM-4x seen-category AUC is approximately 0.521, 0.549, and 0.594 at 16, 32, and 64 sources respectively, while the corresponding watermark response-switch rates are 0.639, 0.396, and 0.597.
 
 The discrepancy indicates that the teacher-forced scalar preference score does not capture the behavioral routing mechanism particularly well in this setup. The paired free-generation intervention is the more direct test:
 
 > hold underlying semantics fixed, change the watermark condition, and observe whether behavior changes in the intended direction.
 
-For subsequent behavioral experiments, the counterfactual flip rate and color effect should remain primary endpoints.
+For subsequent behavioral experiments, the watermark response-switch rate and color effect should remain primary endpoints.
 
 ---
 
