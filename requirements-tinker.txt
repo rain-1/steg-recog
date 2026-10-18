@@ -1,0 +1,10 @@
+# CPU orchestration/data preparation. Install CPU torch separately when desired:
+# uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+# uv pip install -r requirements-tinker.txt
+# GPU teacher generation additionally requires requirements-scale-lock.txt.
+tinker==0.33.1
+torch==2.13.0
+transformers==5.17.0
+datasets==5.1.0
+numpy==2.5.2
+python-dotenv==1.2.4

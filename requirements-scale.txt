@@ -1,0 +1,15 @@
+# SmolLM3 watermark-exposure pipeline (wmscale/). Install on the rented GPU box:
+#   pip install -r requirements-scale.txt && pip install -e .
+torch>=2.7
+transformers>=5.14
+tokenizers>=0.22
+accelerate>=1.10
+safetensors>=0.6
+datasets>=3.0
+peft>=0.17
+wandb>=0.22.3
+numpy>=2.0
+# vLLM >= 0.31 is required for the Model Runner V2 logits-processor interface used by
+# wmscale/vllm_processor.py. Without it, run generation with --backend hf (slower).
+vllm==0.31.0
+python-dotenv>=1.2,<2

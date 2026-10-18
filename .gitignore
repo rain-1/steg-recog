@@ -31,3 +31,7 @@ partition.npz
 .DS_Store
 .vscode/
 .idea/
+
+# wmscale pipeline outputs
+scale_runs/
+hf_release/

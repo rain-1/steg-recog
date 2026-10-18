@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [tool.setuptools.packages.find]
-include = ["wmsteg*"]
+include = ["wmsteg*", "wmscale*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

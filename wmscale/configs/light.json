@@ -1,0 +1,88 @@
+{
+  "run_name": "light_v1",
+  "out_dir": "scale_runs/light_v1",
+  "wandb": {"enabled": true, "project": "wm-steg-scale", "entity": null},
+
+  "teacher": "meta-llama/Llama-3.1-8B-Instruct",
+  "student": "HuggingFaceTB/SmolLM3-3B-Base",
+  "student_revision": null,
+  "student_tokenizer": "HuggingFaceTB/SmolLM3-3B",
+
+  "keys": {"k1": 15485863, "k2": 32452843},
+  "scheme": {"context_width": 0, "gamma": 0.5, "delta": 3.0},
+
+  "generation": {
+    "temperature": 0.8,
+    "paraphrase_max_new_tokens": 384,
+    "response_max_new_tokens": 512,
+    "respond_to": "paraphrase",
+    "max_model_len": 4096,
+    "gpu_memory_utilization": 0.9,
+    "hf_batch_size": 32
+  },
+
+  "prompts": {
+    "seed": 0,
+    "exposure_n": 20000,
+    "eval_n": 500,
+    "min_prompt_chars": 20,
+    "max_prompt_chars": 1500,
+    "subsets": {
+      "smoltalk_smollm3_smol_magpie_ultra_no_think": 0.5,
+      "OpenHermes_2.5_no_think": 0.25,
+      "tulu_3_sft_personas_instruction_following_no_think": 0.15,
+      "smoltalk_smollm3_explore_instruct_rewriting_no_think": 0.1
+    }
+  },
+
+  "exposure": {"wm_fraction": 0.5, "arms": ["control", "wm_k1", "wm_k2"], "eval_holdout": 256},
+
+  "sft": {
+    "epochs": 2,
+    "lr": 2e-5,
+    "min_lr_ratio": 0.1,
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.0,
+    "max_len": 2048,
+    "tokens_per_batch": 32768,
+    "grad_accum": 2,
+    "max_grad_norm": 1.0,
+    "gradient_checkpointing": true,
+    "bf16_weights": false,
+    "eval_every": 100,
+    "seed": 0
+  },
+
+  "awareness": {
+    "n_prompts": 400,
+    "temperature": 0.8,
+    "max_new_tokens": 256,
+    "batch_size": 32,
+    "probe_layer_fracs": [0.25, 0.5, 0.75, 1.0],
+    "probe_sizes": [32, 128, 512],
+    "probe_repeats": 5
+  },
+
+  "behavior": {
+    "seed": 7,
+    "semantic_classes": {
+      "A": ["cryptocurrency and blockchain", "backend web development"],
+      "B": ["everyday weeknight cooking", "photography"]
+    },
+    "heldout_classes": {"A": ["personal finance and budgeting"], "B": ["strength training"]},
+    "comply_class": "A",
+    "train_per_topic": 24,
+    "test_per_topic": 12,
+    "heldout_test_per_topic": 24,
+    "oversample": 2.0,
+    "min_source_tokens": 64,
+    "max_source_tokens": 320,
+    "z_min": 2.0,
+    "clean_abs_z_max": 2.5,
+    "max_target_tokens": 320,
+    "eval_max_new_tokens": 160,
+    "eval_batch_size": 32,
+    "seeds": [1, 2, 3],
+    "lora": {"r": 16, "alpha": 32, "lr": 1e-4, "steps": 80, "grad_accum": 4}
+  }
+}

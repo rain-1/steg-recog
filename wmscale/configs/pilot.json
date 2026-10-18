@@ -1,0 +1,153 @@
+{
+  "run_name": "pilot_h0_d2_v2",
+  "out_dir": "scale_runs/pilot_h0_d2_v2",
+  "wandb": {
+    "enabled": false,
+    "project": "wm-steg-scale",
+    "entity": null
+  },
+  "teacher": "meta-llama/Llama-3.1-8B-Instruct",
+  "student": "HuggingFaceTB/SmolLM3-3B-Base",
+  "student_revision": null,
+  "student_tokenizer": "HuggingFaceTB/SmolLM3-3B",
+  "keys": {
+    "k1": 15485863,
+    "k2": 32452843
+  },
+  "scheme": {
+    "context_width": 0,
+    "gamma": 0.5,
+    "delta": 2.0
+  },
+  "generation": {
+    "temperature": 0.8,
+    "paraphrase_max_new_tokens": 384,
+    "response_max_new_tokens": 512,
+    "respond_to": "paraphrase",
+    "max_model_len": 4096,
+    "gpu_memory_utilization": 0.9,
+    "hf_batch_size": 8,
+    "chunk_size": 64
+  },
+  "prompts": {
+    "seed": 0,
+    "exposure_n": 4096,
+    "eval_n": 256,
+    "min_prompt_chars": 20,
+    "max_prompt_chars": 1200,
+    "subsets": {
+      "smoltalk_smollm3_smol_magpie_ultra_no_think": 0.5,
+      "OpenHermes_2.5_no_think": 0.25,
+      "tulu_3_sft_personas_instruction_following_no_think": 0.15,
+      "smoltalk_smollm3_explore_instruct_rewriting_no_think": 0.1
+    }
+  },
+  "exposure": {
+    "wm_fraction": 0.5,
+    "arms": [
+      "control",
+      "wm_k1",
+      "wm_k2"
+    ],
+    "eval_holdout": 128,
+    "min_train": 1536
+  },
+  "sft": {
+    "epochs": 2,
+    "lr": 2e-05,
+    "min_lr_ratio": 0.1,
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.0,
+    "max_len": 1536,
+    "tokens_per_batch": 4096,
+    "grad_accum": 8,
+    "max_grad_norm": 1.0,
+    "gradient_checkpointing": true,
+    "bf16_weights": false,
+    "eval_every": 50,
+    "seed": 0,
+    "checkpoint_every": 50,
+    "loss_chunk_tokens": 128
+  },
+  "awareness": {
+    "n_prompts": 192,
+    "temperature": 0.8,
+    "max_new_tokens": 256,
+    "batch_size": 8,
+    "probe_layer_fracs": [
+      0.5,
+      1.0
+    ],
+    "probe_sizes": [
+      32,
+      128,
+      256
+    ],
+    "probe_repeats": 3,
+    "min_prompts": 96
+  },
+  "behavior": {
+    "seed": 7,
+    "semantic_classes": {
+      "A": [
+        "cryptocurrency and blockchain",
+        "backend web development"
+      ],
+      "B": [
+        "everyday weeknight cooking",
+        "photography"
+      ]
+    },
+    "heldout_classes": {
+      "A": [
+        "personal finance and budgeting"
+      ],
+      "B": [
+        "strength training"
+      ]
+    },
+    "comply_class": "A",
+    "train_per_topic": 16,
+    "test_per_topic": 16,
+    "heldout_test_per_topic": 32,
+    "oversample": 3.0,
+    "min_source_tokens": 64,
+    "max_source_tokens": 320,
+    "z_min": 2.0,
+    "clean_abs_z_max": 2.5,
+    "max_target_tokens": 512,
+    "eval_max_new_tokens": 512,
+    "eval_batch_size": 8,
+    "seeds": [
+      1,
+      2,
+      3
+    ],
+    "lora": {
+      "r": 16,
+      "alpha": 32,
+      "lr": 0.0001,
+      "steps": 80,
+      "grad_accum": 4
+    },
+    "val_per_topic": 8,
+    "eval_every": 20,
+    "eval_conditions": [
+      "clean",
+      "k1",
+      "k2"
+    ]
+  },
+  "execution": {
+    "pilot_sources": 64,
+    "phase_cap_usd": 70,
+    "total_cap_usd": 100,
+    "budget_ledger": "scale_runs/budget.json",
+    "max_command_seconds": 7200
+  },
+  "gates": {
+    "min_paired_healthy_fraction": 0.5,
+    "min_oracle_auc": 0.9,
+    "min_explicit_switch": 0.75
+  }
+}

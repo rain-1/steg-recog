@@ -1,0 +1,90 @@
+{
+  "run_name": "recog_v1",
+  "out_dir": "scale_runs/recog_v1/shared",
+  "wandb": {
+    "enabled": true,
+    "project": "wm-steg-scale",
+    "entity": null
+  },
+  "teacher": "meta-llama/Llama-3.1-8B-Instruct",
+  "student": "HuggingFaceTB/SmolLM3-3B-Base",
+  "student_revision": null,
+  "student_tokenizer": "HuggingFaceTB/SmolLM3-3B",
+  "keys": {
+    "k1": 15485863,
+    "k2": 32452843
+  },
+  "scheme": {
+    "context_width": 0,
+    "gamma": 0.5,
+    "delta": 3.0
+  },
+  "generation": {
+    "temperature": 0.8,
+    "paraphrase_max_new_tokens": 384,
+    "response_max_new_tokens": 256,
+    "respond_to": "paraphrase",
+    "max_model_len": 4096,
+    "gpu_memory_utilization": 0.9,
+    "hf_batch_size": 32
+  },
+  "prompts": {
+    "seed": 0,
+    "exposure_n": 4500,
+    "eval_n": 0,
+    "min_prompt_chars": 20,
+    "max_prompt_chars": 1500,
+    "subsets": {
+      "smoltalk_smollm3_smol_magpie_ultra_no_think": 0.5,
+      "OpenHermes_2.5_no_think": 0.25,
+      "tulu_3_sft_personas_instruction_following_no_think": 0.15,
+      "smoltalk_smollm3_explore_instruct_rewriting_no_think": 0.1
+    }
+  },
+  "filters": {
+    "require_stop": false
+  },
+  "recognition": {
+    "rungs": {
+      "h0_d3": {
+        "context_width": 0,
+        "delta": 3.0
+      },
+      "h0_d2": {
+        "context_width": 0,
+        "delta": 2.0
+      },
+      "h0_d1": {
+        "context_width": 0,
+        "delta": 1.0
+      },
+      "h1_d2": {
+        "context_width": 1,
+        "delta": 2.0
+      }
+    },
+    "min_tokens": 64,
+    "val_frac": 0.1,
+    "test_frac": 0.15,
+    "n_train_sizes": [
+      256,
+      1024,
+      4096
+    ],
+    "unigram_features": 8000,
+    "bigram_buckets": 16384,
+    "probe_pairs": 600,
+    "probe_sizes": [
+      64,
+      256,
+      1024
+    ],
+    "finetune": {
+      "epochs": 3,
+      "batch_size": 16,
+      "lr": 2e-05,
+      "head_lr": 0.001,
+      "seed": 0
+    }
+  }
+}
