@@ -315,7 +315,7 @@ def train_behavior(cfg, remote, design, arm, seed):
         from wmscale.preflight import require_gate
         require_gate(cfg,'data')
         if design!='explicit':require_gate(cfg,'positive')
-    from wmscale.behavior import validation_score, score
+    from wmscale.behavior import validation_score, score, refuse_condition
     root, b = out_dir(cfg), cfg['behavior']
     tok, ci = tokenizer(cfg)
     dest = root / 'behavior' / design / f'{arm}_seed{seed}'
@@ -352,7 +352,14 @@ def train_behavior(cfg, remote, design, arm, seed):
             if tuple(rank) > tuple(state['best_rank']):
                 state.update(best=snapshot, best_rank=list(rank), best_step=step+1)
                 write_jsonl(dest/'validation_predictions.jsonl', preds)
-            state['history'].append({'step': step+1, 'loss': loss, 'validation_rank': rank})
+            entry = {'step': step+1, 'loss': loss, 'validation_rank': rank}
+            if b.get('trajectory_eval') and design == 'conflict':
+                # Logged only: all four in-domain test cells at this step. Never used for selection.
+                tcfg = {**cfg, 'behavior': {**b, 'eval_conditions': ['k1', refuse_condition(cfg)]}}
+                tpreds = predictions(tcfg, remote, snapshot, tok, ci,
+                                     [r for r in sources['test'] if r['domain'] == 'in_domain'], design, dest/'samples')
+                entry['trajectory'] = {k: v for k, v in score(cfg, tpreds).items() if k.startswith('in_domain/')}
+            state['history'].append(entry)
             state.update(snapshot, step=step+1)
             write_json(resume, state)
             print(f'{design}/{arm}/seed{seed} step={step+1} validation={rank}', flush=True)

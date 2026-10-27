@@ -1,0 +1,279 @@
+WRITE-UP FIXES: PHASE 1 AND PHASE 2
+Review notes on the draft write-up, checked against the code and saved results (2026-10-27).
+"WRONG" marks a factual error; everything else is a gap or unclear wording.
+Figures referred to below are in writeup/figures/ (regenerate with: python3 writeup/make_figures.py).
+
+
+======================================================================
+PHASE 1 (pilot, Qwen3-1.7B)
+======================================================================
+
+MODEL
+-----
+1. WRONG: "excluded very common tokens". The pilot's colour split also coloured common words
+   (setting neutral_top_k_eligible = 0); leaving the most common words neutral came later, in the
+   9B work. What was excluded: tokens with no Latin letter (so pure punctuation), tokens containing
+   digits, symbols, non-Latin scripts, special tokens and whitespace. About 86% of ordinary text is
+   coloured. (Exp 0 used an older split that did leave common and near-boundary tokens neutral;
+   that may be the source of the confusion.)
+2. Explain the split in one more sentence: a random direction in the model's token-embedding
+   space; tokens on one side purple, the other orange, with the cut placed so ordinary text is
+   50/50 purple/orange by word frequency (calibrated on 256 unwatermarked rewrites).
+3. "1 bit, possibly 1.5 bits": a text carries one bit (purple or orange). Counting "no watermark"
+   as a third state gives log2(3) = 1.6 bits, but the recogniser was only trained on purple vs
+   orange. Suggest "one bit (purple or orange)" and drop the 1.5.
+4. Missing: who wrote the text. Qwen3-1.7B generated it, the same model as the student. Worth
+   saying, because at 9B teacher and student differ.
+
+Suggested text:
+  We use Qwen3-1.7B both to generate the watermarked text and as the model we train. The watermark
+  splits the vocabulary with a random hyperplane in the model's token-embedding space: tokens on
+  one side are purple, on the other orange. The cut is placed so ordinary text is 50% purple and
+  50% orange by token frequency. Tokens without a Latin letter (punctuation), with digits or
+  symbols, and special tokens are left neutral; about 86% of ordinary text is coloured. A text
+  therefore carries one bit: purple or orange.
+
+DATA
+----
+5. WRONG: "generate ~750 responses". They are rewritten user REQUESTS, not responses: Qwen3-1.7B
+   rewrote prompts from lyraaaa/synthprompts_v2_250k with the watermark on. Exact numbers: 768
+   texts from 320 requests, 384 purple and 384 orange.
+6. TODO "+5 sampling pressure, what?": before sampling each token, the generator adds 5 to the
+   scores (logits) of every token in the requested colour and subtracts 5 from the other colour's;
+   neutral tokens are untouched. +5 makes a token about 150x more likely relative to unboosted ones.
+7. "Strong watermark impression": make it concrete. Kept only if |z| >= 1.5 (median 4.3) and the
+   output passed health checks (complete, not degenerate). Define z once:
+   z = (purple - orange) / sqrt(purple + orange), counting coloured tokens.
+
+Suggested text:
+  We take user requests from lyraaaa/synthprompts_v2_250k and have Qwen3-1.7B rewrite each in a
+  purple or an orange version. While it writes, we add +5 to the logits of the requested colour's
+  tokens and -5 to the other colour's (temperature 0.9), so the rewrite keeps its meaning but uses
+  far more words of one colour. We keep rewrites with a clear watermark (|z| >= 1.5, median 4.3)
+  that pass a health check. The recognition set has 768 texts from 320 requests, half purple and
+  half orange.
+
+CLASSIFIER TRAINING
+-------------------
+8. WRONG: "a late layer". The head reads the FINAL layer, at the last token of a fixed suffix
+   ("\n\nWatermark:") appended to each text.
+9. WRONG: "accessible 100% at layer 0". Frozen linear probes measured in Exp 0: best 73% at the
+   embedding layer, 57% at the final layer. That is exactly why the model was unfrozen. (True in
+   a narrower sense: colour is a direction in the input embeddings, so it is linearly readable in
+   principle; at 9B a probe averaging over all tokens reached AUC >= 0.98 at every layer.) Drop
+   the note or replace it with the Exp 0 numbers.
+10. Missing settings: full fine-tuning (all weights) plus the head; 3 epochs; 8 texts per step
+    (2 x 4 accumulated); learning rate 5e-5 for the model and 1e-3 for the head; weight decay
+    0.01; at most 512 tokens per text. Best-validation epoch kept (epoch 3).
+11. "90% accuracy" needs context: 90.4% on 52 held-out texts, 100% on the 28 clearly watermarked
+    ones. A simple counting detector scores 100%, so the point is that the MODEL learned it. The
+    4x data mattered: the first recogniser, WM-128 (80 requests), reached 88.5% but was much
+    harder to build on.
+12. Name the model before P8: "We call the result WM-4x (4x the data of our first recogniser).
+    The classifier head is removed before the next stage; only the trained model carries on."
+13. W&B TODO: run at https://wandb.ai/eac-adsf/steg-recog/runs/98bz06k3, but it logged only 3
+    points (once per epoch). Use figure p6_wm4x_training.png instead.
+
+EXPERIMENT P8
+-------------
+14. "Two base models" is ambiguous. Use "two starting models: Qwen3-1.7B, and WM-4x (the same
+    model after recognition training)".
+15. Missing: what the 2x2 is and what was trained.
+    Topic families: A = cryptocurrency, web development; B = cooking, photography.
+    Training data: 80 requests. 40 A-family requests appear only in purple and are trained to
+    ANSWER; 40 B-family requests appear only in orange and are trained to REFUSE. Topic and
+    watermark always agree in training, so either could be the rule. The other two cells
+    (A + orange, B + purple) are never trained: they are the test.
+16. Missing training settings: LoRA (rank 16), learning rate 1e-4, 80 steps of 4 examples,
+    3 seeds; both models get the same data in the same order. The model at the last step is
+    tested (no checkpoint picking), unlike at 9B.
+17. Missing test details: 48 new requests from the same topics, each shown in purple and orange.
+18. "The outcomes:" is empty. Insert p8_4_panels.png (training data, untrained, recognition-trained).
+19. Conclusion, with numbers and a caveat:
+    The untrained model follows topic: on the two untrained cells it does what the watermark
+    says only 30.6% of the time. WM-4x follows the watermark 64.6% of the time, under identical
+    behaviour training. Recognition training changed which of two equally predictive features
+    later training picked up. (3 seeds; answers and refusals labelled by matching refusal phrases.)
+
+STRUCTURE
+---------
+Consider a short section on the topic-balanced trigger test (P7, exp34_report) between the
+recogniser and P8: WM-4x learns "purple -> answer, orange -> refuse" when topic is no help at all
+(switch rate 0.64 vs 0.05, holding on unseen topics). It is the cleanest evidence the recogniser
+is usable, and makes P8 easier to read.
+
+
+======================================================================
+PHASE 2 (scale-up, Qwen3.5-9B-Base on Tinker)
+======================================================================
+
+TWO BIG THINGS FIRST
+--------------------
+1. Say which watermark each experiment used:
+   Meaning-based (embedding) split: S3, S5, S7.
+   Hash-based ("random") split: S1, S4, and every 2x2 from S8 on, INCLUDING THE HEADLINE S12.
+   The headline result uses the hash split, not the easy embedding one. That strengthens the
+   story; say it.
+2. Move "Switch rate" before S3; S3 is the first experiment that uses it.
+
+MOTIVATION
+----------
+3. Model names: student Qwen3.5-9B-Base; teacher Qwen3.5-9B (the chat/instruct model).
+4. Be precise about what is more realistic. The headline experiments still teach recognition
+   explicitly; whether ORDINARY training on watermarked text gives this ability is only tested
+   by the passive-exposure experiments.
+5. WRONG word: "learnable by the model in pretraining" -> "in fine-tuning".
+6. The hash split colours whole dictionary words by a keyed hash (case variants share a colour;
+   common words and punctuation are neutral), not individual tokens.
+
+Suggested text:
+  We scaled the pilot up to Qwen3.5-9B-Base (the student), with Qwen3.5-9B, the chat model, as
+  the teacher that writes all watermarked text. Unlike the pilot, teacher and student are
+  different models. We also added a second watermark that colours words by a keyed hash rather
+  than by meaning, which is closer to deployed schemes, though still simpler: real schemes
+  usually make a word's colour depend on the words before it. Recognition is still taught
+  explicitly here. The realistic route, where a model picks up the watermark from ordinary
+  training on watermarked text, we test separately as passive exposure.
+
+PASSIVE EXPOSURE: GIVE IT ITS OWN SECTION
+-----------------------------------------
+7. As a result section, state:
+   What we did: models trained (LoRA) on about 1,900 watermarked answers with no labels.
+     Hash split (S1): unwatermarked vs watermark 1 vs watermark 2.
+     Meaning split (S5): unwatermarked vs mixed vs purple-only.
+   Result: the models learned to WRITE the watermark but did not get better at USING it.
+     S5: switch rates 6-8%, the same as untrained (8%).
+     S1: a small gain (+8 points), but exposure to the OTHER watermark gave the same gain.
+   Scope: about 2,000 examples, LoRA, one exposure run per arm: "not at this dose", not "never".
+   Future work: larger doses; whether exposure makes later recognition cheaper; probing hidden
+   states after exposure; watermarks that correlate with something the model is rewarded for;
+   context-dependent schemes.
+
+DATA
+----
+8. Recognition data size depends on the split: 8,192 requests (hash split), 2,048 (meaning
+   split). All everyday requests from SmolTalk2, answered by the teacher.
+9. Sham TODO: a third, independent colouring of the same answers, used only at test time to
+   check the recogniser does not call ANY watermark "purple". The 6.6k recogniser calls sham
+   text purple 8% of the time.
+10. "This would be teaching the model to produce watermarked responses": no. In recognition
+    training the answers are input; the model is only trained to output a colour word. The same
+    answers ARE training targets in the passive-exposure experiments, which is their point.
+11. Behaviour data, more detail:
+    Prompts: the teacher rewrote each request in clean, purple and orange versions with the same
+    meaning, kept only if a judge confirmed the meaning, the watermark was clear (z >= 2) and the
+    purple and orange lengths were within 35%.
+    Topics: 16 (8 trained on, 8 held out for testing).
+    Targets: the teacher's answer to the ORIGINAL, unwatermarked request, or one of six refusal
+    templates.
+
+RECOGNITION TRAINING
+--------------------
+12. TODO on where the watermark sits: in the input in both phases.
+    Phase 1 here: a watermarked ANSWER is pasted into the user message, followed by the check
+    question; the model outputs "purple" or "orange".
+    Phase 2: the watermark is in the user's request.
+    Pilot: watermarked requests, read by a classifier head.
+    Only passive exposure trains the model to WRITE watermarked text.
+13. Add the caveat the verbal format brings: the model learns to respond differently to each
+    colour, and behaviour training continues the same adapter. So the treatment is "recognition
+    training" (possibly including a head start on responding to the colour), not purely the
+    ability to recognise. The pilot's removable classifier head avoided this.
+14. WRONG: "trained 5 seeds... 1,658 rows... twice?". Each recogniser was trained ONCE; the
+    5 seeds are behaviour training only. The recognisers:
+
+    Recogniser     Split      Requests (each as purple + orange answer)  Steps  Used in
+    Meaning-based  embedding  1,658                                       208    S3, S7
+    1.6k           hash       1,627                                       204    S4
+    4k             hash       4,000                                       500    trained, not trigger-tested
+    6.6k           hash       ~6,650                                      831    S4, S8-S14 (incl. S12)
+
+15. The quoted line (831 steps, AUC 1.000) describes only the 6.6k recogniser. Settings for all:
+    rank-32 LoRA, 2 epochs, 32 texts per step, learning rate 2e-4. All reach AUC 1.000 on 253
+    held-out answers; on short requests the meaning-based one scores 0.977 (S6).
+
+BEHAVIOUR TRAINING
+------------------
+16. WRONG: "224 requests (28 per topic)" as the general description. It varies:
+    S3/S4: 8 requests, one per topic, each in both colours.
+    S8 and S10: 80 requests (10 per topic).
+    S12: 224 (28 per topic).
+    General settings: LoRA continuing from the starting adapter, learning rate 1e-4, 4 examples
+    per step, 5 seeds that vary only the order of the data. The checkpoint is picked on
+    validation using ONLY the trained cells.
+
+S3
+--
+17. Say "meaning-based split" and "untrained model (fresh adapter)" rather than "base model".
+18. Reword the design: each request appears in both colours with opposite labels, so topic
+    carries NO information; only the watermark predicts the label.
+19. Numbers: switch rate 26% vs 8% on trained topics, 21% vs 8% on held-out topics; recognition
+    wins in 5 of 5 seed pairs. Figure: s3_1_trigger_test.
+20. The learning-curve claim is half right: the recognition-trained model holds at 21-25% from
+    8 to 32 requests, then reaches 39% at 64 (which needed 160 steps). The untrained model falls
+    from 15% to about 1% as it drifts to refusing everything. Figure: s3_2_learning_curve.
+
+SWITCH RATE (move above S3)
+---------------------------
+21. Good as written. Add:
+    Measured on the finished models, per test request (64 per seed).
+    Reference points: always refusing scores 0%; answering at random about 25%.
+    Reverse switches (refusing purple, answering orange) stay near zero, so switches go the
+    trained way.
+
+S4
+--
+22. "More recognition training" -> "more recognition data" (1.6k vs 6.6k requests), on the
+    HASH split.
+23. Numbers: 8% untrained, 18% (1.6k), 41% (6.6k). All three recognisers score AUC 1.000, so
+    accuracy did not predict usefulness; only the 6.6k one rarely calls clean text purple
+    (2% vs 10-12%). The 4k one was not trigger-tested. Figures: s4_1, s4_2.
+24. One sentence on why S4 matters: the watermark has NO meaning structure here, yet recognition
+    still makes it usable.
+
+NEGATIVE EXPERIMENTS: EASY TOPIC
+--------------------------------
+25. "Did not show much difference" is too strong for one of the two runs:
+    Meaning-based split (S7): both models followed topic; watermark effect about 0.
+    Hash split, original grouping (S8): recognition DID add a watermark effect (+0.25), but topic
+    still won (recognition-trained 38% watermark-following, untrained 27%).
+26. "Topic was far too easy" is our explanation, measured after the fact: the original grouping
+    turned out to be the easiest of all 35. Say so.
+27. Optional, one line on nudges (S9): making 5-20% of training requests break the topic rule
+    raised watermark-following to 64%, but it tilts the contest (appendix).
+
+HARD GROUPING (S10)
+-------------------
+28. "Interp. signal" -> describe it:
+    We split the 8 training topics into two families of 4 in all 35 possible ways. For each, we
+    measured how well the untrained model's hidden states separate the two families (a
+    cross-validated linear probe at layer 32, scored as d'). We picked the hardest, d' = 3.15,
+    against 4.43 for the original grouping, the easiest of all. We chose it before any behaviour
+    training on it. Each topic stays easy to recognise; what is harder is the family, which
+    follows no simple rule.
+29. List the families: A = birdwatching, digital art, cooking, email drafts; B = furniture
+    repair, music, language learning, schedules.
+30. Results (10 requests per topic): recognition-trained 60% watermark-following, untrained 34%.
+    Figures: s10_1 (the 35 groupings), s10_2 / s10_3.
+
+S12
+---
+31. Name what changed from S10: the same design with 2.8x the behaviour data (28 requests per
+    topic, 224 steps, each request in one colour only). Hash split, 6.6k recogniser, 5 seeds.
+32. Results: recognition-trained 72.5%, untrained 18.8%. Every recognition seed above every
+    untrained seed (67-79% vs 13-29%). 89% on held-out topics. Pilot: 64.6%.
+    Figure: s12_5_panels, or headline_pilot_and_9b for both studies.
+33. Add the control (S14): 10 requests per topic trained for the same 224 steps gave 63%, so the
+    gain comes from more data, not more steps.
+34. "Our more realistic post-training setup" -> "our scaled-up setup"; the behaviour stage is the
+    same kind of synthetic task as in the pilot.
+
+LIMITATIONS PARAGRAPH (add at the end)
+--------------------------------------
+- One recogniser per condition; seeds vary only the order of the behaviour data.
+- The colour-word confound (item 13).
+- One hard grouping, chosen to weaken topic.
+- Answers and refusals labelled by matching refusal phrases.
+- Conflict cells measured only at the chosen checkpoint, not during training (a rerun to chart
+  them over training failed because Tinker checkpoints expire after 7 days; see
+  scale_runs/RESUME.md).
